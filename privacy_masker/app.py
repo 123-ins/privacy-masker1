@@ -54,7 +54,7 @@ def _check_dependencies() -> list[str]:
     # spaCy + GiNZA
     try:
         import spacy
-        spacy.load("ja_ginza")
+        spacy.load("ja_core_news_lg")
     except OSError:
         errors.append(
             "❌ **GiNZA モデルが見つかりません。**\n"
