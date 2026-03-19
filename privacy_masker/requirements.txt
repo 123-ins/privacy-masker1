@@ -6,3 +6,4 @@ opencv-python-headless
 Pillow
 numpy
 numpy<2.0.0
+https://github.com/megagonlabs/ginza/releases/download/v5.1.2/ja_ginza-5.1.2-py3-none-any.whl
