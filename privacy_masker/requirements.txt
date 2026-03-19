@@ -2,7 +2,6 @@ streamlit
 pytesseract
 spacy
 ginza
-ja-ginza
 opencv-python-headless
 Pillow
 numpy
