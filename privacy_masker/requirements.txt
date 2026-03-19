@@ -1,9 +1,8 @@
 streamlit
-pytesseract
-spacy
-https://github.com/explosion/spacy-models/releases/download/ja_core_news_sm-3.7.0/ja_core_news_sm-3.7.0-py3-none-any.whl
-opencv-python-headless
 Pillow
-numpy
+opencv-python-headless
+pytesseract
+spacy==3.7.4
 numpy<2.0.0
-https://github.com/megagonlabs/ginza/releases/download/v5.1.2/ja_ginza-5.1.2-py3-none-any.whl
+ginza==5.2.0
+https://github.com/megagonlabs/ginza/releases/download/v5.2.0/ja_ginza-5.2.0-py3-none-any.whl
