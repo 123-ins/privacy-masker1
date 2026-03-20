@@ -3,6 +3,3 @@ numpy<2
 pillow
 opencv-python-headless
 pytesseract
-spacy==3.7.4
-ginza==5.2.0
-ja-ginza==5.2.0
