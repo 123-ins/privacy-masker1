@@ -1,8 +1,8 @@
 streamlit
-Pillow
+numpy<2
+pillow
 opencv-python-headless
 pytesseract
 spacy==3.7.4
-numpy<2.0.0
 ginza==5.2.0
-https://github.com/megagonlabs/ginza/releases/download/v5.2.0/ja_ginza-5.2.0-py3-none-any.whl
+ja-ginza==5.2.0
