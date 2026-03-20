@@ -384,9 +384,11 @@ def merge_boxes_into_lines(
 # =====================================================================
 
 TARGET_NER_LABELS: set[str] = {
-    "Person", "PERSON", "ORG", "Organization",
+    "Person", "PERSON",
+    "ORG", "Organization",
     "LOC", "Location", "GPE", "FAC", "Facility",
-    "PRODUCT", "Product", "EVENT", "Event", "NORP",
+}
+
 }
 
 REGEX_PATTERNS: list[tuple[str, re.Pattern]] = [
@@ -417,6 +419,84 @@ def detect_regex(text: str) -> list[tuple[str, str, int, int]]:
     return results
 
 
+PHONE_RE_STRICT = re.compile(r"(?<!\d)0\d{1,4}[-ー−‐]?\d{1,4}[-ー−‐]?\d{3,4}(?!\d)")
+EMAIL_RE_STRICT = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+FORM_LABEL_RULES: dict[str, str] = {
+    "担当者名": "Person",
+    "氏名": "Person",
+    "電話番号": "電話番号",
+    "メールアドレス": "メール",
+}
+
+ANCHOR_STOP_WORDS = [
+    "FAX", "ＦＡＸ",
+    "役職名", "団体名", "出展名",
+    "担当者名", "氏名", "電話番号", "メールアドレス",
+]
+
+def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
+    """
+    定型帳票向け:
+    「担当者名」「氏名」「電話番号」「メールアドレス」の
+    ラベル直後の値を優先的に拾う。
+    """
+    if not text.strip():
+        return []
+
+    txt = text.replace(" ", "").replace("　", "")
+    results: list[tuple[str, str, int, int]] = []
+
+    for anchor, out_label in FORM_LABEL_RULES.items():
+        pos = txt.find(anchor)
+        if pos == -1:
+            continue
+
+        value_start = pos + len(anchor)
+        raw_tail = txt[value_start:]
+
+        tail = re.sub(r"^[\s:：\-ー_.・]+", "", raw_tail)
+        value_start += (len(raw_tail) - len(tail))
+
+        if not tail:
+            continue
+
+        if out_label == "電話番号":
+            m = PHONE_RE_STRICT.search(tail)
+            if m:
+                s = value_start + m.start()
+                e = value_start + m.end()
+                results.append((m.group(), out_label, s, e))
+            continue
+
+        if out_label == "メール":
+            m = EMAIL_RE_STRICT.search(tail)
+            if m:
+                s = value_start + m.start()
+                e = value_start + m.end()
+                results.append((m.group(), out_label, s, e))
+            continue
+
+        stop = len(tail)
+        for sw in ANCHOR_STOP_WORDS:
+            p = tail.find(sw)
+            if p != -1:
+                stop = min(stop, p)
+
+        candidate = tail[:stop]
+        candidate = re.sub(r"[^0-9A-Za-zぁ-んァ-ヶ一-龥々ー・]", "", candidate).strip()
+
+        if 2 <= len(candidate) <= 20:
+            s = txt.find(candidate, value_start)
+            if s != -1:
+                e = s + len(candidate)
+                results.append((candidate, out_label, s, e))
+
+    return results
+
+
+
+
 # =====================================================================
 # 8. 重複リージョン除去（IoU ベース）
 # =====================================================================
@@ -436,7 +516,9 @@ def _iou(a: MaskRegion, b: MaskRegion) -> float:
 def deduplicate_regions(regions: list[MaskRegion], iou_threshold: float = 0.5) -> list[MaskRegion]:
     """IoU が閾値以上のリージョンを NER 優先でまとめる（NMS 的処理）。"""
     # NER を優先（NER を先に並べる）
-    sorted_regions = sorted(regions, key=lambda r: (0 if r.source == "ner" else 1))
+    priority = {"anchor": 0, "ner": 1, "regex": 2}
+    sorted_regions = sorted(regions, key=lambda r: (priority.get(r.source, 9), r.top, r.left))
+
     kept: list[MaskRegion] = []
     suppressed = [False] * len(sorted_regions)
     for i, r in enumerate(sorted_regions):
@@ -572,13 +654,26 @@ def process_image(
     all_regions: list[MaskRegion] = []
 
     for line_text, line_boxes in lines:
-        entities: list[tuple[str, str, int, int, str]] = []
+                entities: list[tuple[str, str, int, int, str]] = []
+
+        # 1) 定型帳票の項目名ベース検出（最優先）
+        anchor_hits = detect_form_anchors(line_text)
+        entities += [(t, l, s, e, "anchor") for t, l, s, e in anchor_hits]
+
+        # 2) NER
         if use_ner:
             entities += [(t, l, s, e, "ner")
                          for t, l, s, e in detect_ner(nlp, line_text, target_labels)]
+
+        # 3) 正規表現
         if use_regex:
-            entities += [(t, l, s, e, "regex")
-                         for t, l, s, e in detect_regex(line_text)]
+            regex_hits = detect_regex(line_text)
+
+            # FAX行にある電話番号は変換しない
+            if "FAX" in line_text.upper() or "ＦＡＸ" in line_text:
+                regex_hits = [x for x in regex_hits if x[1] != "電話番号"]
+
+            entities += [(t, l, s, e, "regex") for t, l, s, e in regex_hits]
 
         for ent_text, ent_label, cs, ce, src in entities:
             anon = anon_mgr.get_anon_label(ent_text, ent_label)
@@ -671,9 +766,11 @@ def main() -> None:
 
         st.subheader("NER ラベル選択")
         all_labels = [
-            "Person", "PERSON", "ORG", "Organization",
-            "LOC", "Location", "GPE", "FAC", "Facility",
-            "PRODUCT", "Product", "EVENT", "Event", "NORP",
+    "Person", "PERSON",
+    "ORG", "Organization",
+    "LOC", "Location", "GPE", "FAC", "Facility",
+]
+
         ]
         selected = st.multiselect("対象ラベル", all_labels, default=all_labels)
 
@@ -789,26 +886,44 @@ def main() -> None:
     for fname, original, masked, regions, lines in results:
         st.markdown(f"---\n### 📄 {fname}")
 
+        # -----------------------------
+        # 確認UI: チェックを外すと変換しない
+        # -----------------------------
+        if regions:
+            with st.expander(f"🔍 検出・置換結果（{len(regions)} 件）", expanded=True):
+                st.caption("チェックを外すと、その項目は変換しません（FAXや誤検出の除外用）。")
+
+                selected_regions = []
+                for i, r in enumerate(regions):
+                    method_name = {
+                        "anchor": "項目名ベース",
+                        "ner": "NER",
+                        "regex": "正規表現",
+                    }.get(r.source, r.source)
+
+                    keep = st.checkbox(
+                        f"[{r.label}] {r.original_text} → {r.anon_text} / {method_name}",
+                        value=True,
+                        key=f"keep_{fname}_{i}",
+                    )
+                    if keep:
+                        selected_regions.append(r)
+        else:
+            selected_regions = []
+            st.warning("⚠️ 固有表現は検出されませんでした。OCR の信頼度閾値を下げてみてください。")
+
+        # チェック後のリージョンで再描画
+        original_bgr = cv2.cvtColor(np.array(original), cv2.COLOR_RGB2BGR)
+        masked_checked = render_anon_labels(original_bgr, selected_regions, font, bg_color, text_color)
+        masked_rgb = cv2.cvtColor(masked_checked, cv2.COLOR_BGR2RGB)
+
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("**元画像**")
             st.image(original, use_container_width=True)
         with col2:
-            st.markdown("**匿名化後**")
-            masked_rgb = cv2.cvtColor(masked, cv2.COLOR_BGR2RGB)
+            st.markdown("**匿名化後（確認反映済み）**")
             st.image(masked_rgb, use_container_width=True)
-
-        if regions:
-            with st.expander(f"🔍 検出・置換結果（{len(regions)} 件）", expanded=True):
-                table_data = [{
-                    "元テキスト": r.original_text,
-                    "匿名ラベル": r.anon_text,
-                    "カテゴリ": r.label,
-                    "検出方法": "NER" if r.source == "ner" else "正規表現",
-                } for r in regions]
-                st.table(table_data)
-        else:
-            st.warning("⚠️ 固有表現は検出されませんでした。OCR の信頼度閾値を下げてみてください。")
 
         with st.expander("📝 OCR テキスト（デバッグ用）"):
             for line_text, _ in lines:
@@ -819,6 +934,7 @@ def main() -> None:
         buf = BytesIO()
         from PIL import Image as PILImage
         PILImage.fromarray(masked_rgb).save(buf, format="PNG")
+
         st.download_button(
             label=f"⬇️ {fname} の匿名化画像をダウンロード",
             data=buf.getvalue(),
