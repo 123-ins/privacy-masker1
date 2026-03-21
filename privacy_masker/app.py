@@ -641,29 +641,29 @@ def process_image(
                 entities: list[tuple[str, str, int, int, str]] = []
 
                 # 1) 定型帳票の項目名ベース検出（最優先）
-                anchor_hits = detect_form_anchors(line_text)
-                entities += [(t, l, s, e, "anchor") for t, l, s, e in anchor_hits]
+        anchor_hits = detect_form_anchors(line_text)
+        entities += [(t, l, s, e, "anchor") for t, l, s, e in anchor_hits]
 
-        # 2) NER
-        if use_ner:
-            entities += [(t, l, s, e, "ner")
-                         for t, l, s, e in detect_ner(nlp, line_text, target_labels)]
+                # 2) NER
+                if use_ner:
+                    entities += [(t, l, s, e, "ner")
+                                 for t, l, s, e in detect_ner(nlp, line_text, target_labels)]
 
-        # 3) 正規表現
-        if use_regex:
-            regex_hits = detect_regex(line_text)
+                # 3) 正規表現
+                if use_regex:
+                    regex_hits = detect_regex(line_text)
 
-            # FAX行にある電話番号は変換しない
-            if "FAX" in line_text.upper() or "ＦＡＸ" in line_text:
-                regex_hits = [x for x in regex_hits if x[1] != "電話番号"]
+                    # FAX行にある電話番号は変換しない
+                    if "FAX" in line_text.upper() or "FAX" in line_text:
+                        regex_hits = [x for x in regex_hits if x[1] != "電話番号"]
 
-            entities += [(t, l, s, e, "regex") for t, l, s, e in regex_hits]
+                    entities += [(t, l, s, e, "regex") for t, l, s, e in regex_hits]
 
-        for ent_text, ent_label, cs, ce, src in entities:
-            anon = anon_mgr.get_anon_label(ent_text, ent_label)
-            region = map_entity_to_boxes(ent_text, ent_label, anon, cs, ce, line_boxes, source=src)
-            if region:
-                all_regions.append(region)
+                for ent_text, ent_label, cs, ce, src in entities:
+                    anon = anon_mgr.get_anon_label(ent_text, ent_label)
+                    region = map_entity_to_boxes(ent_text, ent_label, anon, cs, ce, line_boxes, source=src)
+                    if region:
+                        all_regions.append(region)
 
     # 重複排除
     all_regions = deduplicate_regions(all_regions)
