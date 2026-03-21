@@ -30,15 +30,13 @@ import cv2
 import numpy as np
 import streamlit as st
 
+
 # =====================================================================
 # 0. 起動時チェック（Tesseract / spaCy / GiNZA）
 # =====================================================================
 
 def _check_dependencies() -> list[str]:
-    """不足している依存関係のリストを返す。空なら全OK。"""
     errors: list[str] = []
-
-    # Tesseract
     try:
         import pytesseract
         pytesseract.get_tesseract_version()
@@ -59,7 +57,6 @@ def _check_dependencies() -> list[str]:
 
 @dataclass
 class OCRBox:
-    """Tesseract が返す 1 単語ぶんのバウンディングボックス."""
     text: str
     left: int
     top: int
@@ -78,7 +75,6 @@ class OCRBox:
 
 @dataclass
 class MaskRegion:
-    """匿名化対象領域."""
     original_text: str
     label: str
     anon_text: str
@@ -98,10 +94,6 @@ class MaskRegion:
 # =====================================================================
 
 class AnonymizationManager:
-    """
-    同一エンティティに同一の仮名ラベルを割り当てる。
-    カテゴリごとに独立したカウンタを持つ。
-    """
 
     @staticmethod
     def _person_label(index: int) -> str:
@@ -171,6 +163,7 @@ class AnonymizationManager:
         "電話番号": "phone",
         "郵便番号": "postal",
         "メール": "email",
+        "住所": "location",
         "日付(生年月日)": "date",
         "口座番号": "account",
         "マイナンバー": "mynumber",
@@ -235,7 +228,6 @@ def load_nlp():
     return None
 
 
-
 # =====================================================================
 # 4. 日本語フォント読み込み（PIL 描画用）
 # =====================================================================
@@ -244,26 +236,21 @@ def load_nlp():
 def load_font(size: int = 20):
     from PIL import ImageFont
 
-    # 静的候補
     candidates = [
-        # Linux (Ubuntu / Debian)
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/OTF/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/google-noto-cjk/NotoSansCJKjp-Regular.otf",
         "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
-        # macOS
         "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
-        # Windows
         r"C:\Windows\Fonts\msgothic.ttc",
         r"C:\Windows\Fonts\meiryo.ttc",
         r"C:\Windows\Fonts\YuGothR.ttc",
     ]
 
-    # fc-list による動的探索（Linux / macOS）
     try:
         result = subprocess.run(
             ["fc-list", ":lang=ja", "--format=%{file}\n"],
@@ -281,19 +268,16 @@ def load_font(size: int = 20):
             except Exception:
                 continue
 
-    # フォールバック（サイズ無効だが動く）
     return ImageFont.load_default()
 
 
 def get_sized_font(base_font, size: int):
-    """フォントを指定サイズで再取得する。失敗時は base_font を返す。"""
     from PIL import ImageFont
     if hasattr(base_font, "path"):
         try:
             return ImageFont.truetype(base_font.path, size)
         except Exception:
             pass
-    # font_variant が使えるか試す
     if hasattr(base_font, "font_variant"):
         try:
             return base_font.font_variant(size=size)
@@ -309,7 +293,6 @@ def get_sized_font(base_font, size: int):
 def run_ocr(image: np.ndarray, lang: str = "jpn+eng", conf_threshold: float = 30.0) -> list[OCRBox]:
     import pytesseract
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # 適応的二値化でコントラストを高める
     binary = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -363,7 +346,7 @@ def merge_boxes_into_lines(
 
 
 # =====================================================================
-# 7. NER + 正規表現検出
+# 7. 正規表現・項目名ベース検出
 # =====================================================================
 
 TARGET_NER_LABELS: set[str] = {
@@ -372,10 +355,18 @@ TARGET_NER_LABELS: set[str] = {
     "LOC", "Location", "GPE", "FAC", "Facility",
 }
 
+# 電話番号: ハイフンにI(アイ)が混入するケースも考慮
+PHONE_RE_STRICT = re.compile(
+    r"(?<!\d)0\d{1,4}[-ーI\-−‐]\d{1,4}[-ーI\-−‐]\d{3,4}(?!\d)"
+)
+EMAIL_RE_STRICT = re.compile(
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+)
+
 REGEX_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("電話番号",       re.compile(r"0\d{1,4}[-ー]?\d{1,4}[-ー]?\d{3,4}")),
+    ("電話番号",       PHONE_RE_STRICT),
     ("郵便番号",       re.compile(r"〒?\d{3}[-ー]\d{4}")),
-    ("メール",         re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")),
+    ("メール",         EMAIL_RE_STRICT),
     ("マイナンバー",   re.compile(r"\b\d{4}\s?\d{4}\s?\d{4}\b")),
     ("日付(生年月日)", re.compile(
         r"(昭和|平成|令和|S|H|R)?\s?\d{1,4}\s?[年/\-\.]\s?\d{1,2}\s?[月/\-\.]\s?\d{1,2}\s?日?"
@@ -383,13 +374,27 @@ REGEX_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("口座番号",       re.compile(r"(普通|当座)\s?\d{7,8}")),
 ]
 
+# 帳票ラベル → 検出カテゴリ のマッピング
+FORM_LABEL_RULES: dict[str, str] = {
+    "担当者名": "Person",
+    "氏名":     "Person",
+    "住所":     "住所",
+    "所在地":   "住所",
+    "電話番号": "電話番号",
+    "メールアドレス": "メール",
+    "団体名":   "ORG",
+}
 
-def detect_ner(nlp, text: str, labels: set[str]) -> list[tuple[str, str, int, int]]:
-    if not text.strip():
-        return []
-    doc = nlp(text)
-    return [(e.text, e.label_, e.start_char, e.end_char)
-            for e in doc.ents if e.label_ in labels]
+# アンカー検出時に「値の終端」とみなす語
+ANCHOR_STOP_WORDS = [
+    "FAX", "ＦＡＸ", "Fax",
+    "役職名", "団体名", "出展名",
+    "担当者名", "氏名", "電話番号", "メールアドレス",
+    "住所", "所在地",
+]
+
+# FAX行と判定するパターン
+FAX_LINE_PATTERN = re.compile(r"FAX|ＦＡＸ|Fax|fax", re.IGNORECASE)
 
 
 def detect_regex(text: str) -> list[tuple[str, str, int, int]]:
@@ -400,35 +405,24 @@ def detect_regex(text: str) -> list[tuple[str, str, int, int]]:
     return results
 
 
-PHONE_RE_STRICT = re.compile(r"(?<!\d)0\d{1,4}[-ー−‐]?\d{1,4}[-ー−‐]?\d{3,4}(?!\d)")
-EMAIL_RE_STRICT = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+def detect_ner(nlp, text: str, labels: set[str]) -> list[tuple[str, str, int, int]]:
+    if not text.strip() or nlp is None:
+        return []
+    doc = nlp(text)
+    return [(e.text, e.label_, e.start_char, e.end_char)
+            for e in doc.ents if e.label_ in labels]
 
-FORM_LABEL_RULES: dict[str, str] = {
-    "担当者名": "Person",
-    "氏名": "Person",
-    "住所": "住所",
-    "所在地": "住所",
-    "電話番号": "電話番号",
-    "メールアドレス": "メール",
-}
-
-
-ANCHOR_STOP_WORDS = [
-    "FAX", "ＦＡＸ",
-    "役職名", "団体名", "出展名",
-    "担当者名", "氏名", "電話番号", "メールアドレス",
-]
 
 def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
     """
-    定型帳票向け:
-    「担当者名」「氏名」「電話番号」「メールアドレス」の
-    ラベル直後の値を優先的に拾う。
+    帳票の項目名（担当者名・氏名・電話番号・メールアドレス等）の
+    直後の値を優先的に検出する。
     """
     if not text.strip():
         return []
 
-    txt = text.replace(" ", "").replace("　", "")
+    # スペース除去してマッチしやすくする
+    txt = text.replace(" ", "").replace("\u3000", "")
     results: list[tuple[str, str, int, int]] = []
 
     for anchor, out_label in FORM_LABEL_RULES.items():
@@ -439,12 +433,14 @@ def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
         value_start = pos + len(anchor)
         raw_tail = txt[value_start:]
 
+        # コロン・スペース・記号を読み飛ばす
         tail = re.sub(r"^[\s:：\-ー_.・]+", "", raw_tail)
         value_start += (len(raw_tail) - len(tail))
 
         if not tail:
             continue
 
+        # 電話番号ラベルの場合は PHONE_RE_STRICT で抽出
         if out_label == "電話番号":
             m = PHONE_RE_STRICT.search(tail)
             if m:
@@ -453,6 +449,7 @@ def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
                 results.append((m.group(), out_label, s, e))
             continue
 
+        # メールの場合は EMAIL_RE_STRICT で抽出
         if out_label == "メール":
             m = EMAIL_RE_STRICT.search(tail)
             if m:
@@ -461,24 +458,29 @@ def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
                 results.append((m.group(), out_label, s, e))
             continue
 
+        # 人名・住所・組織名は次のアンカー語の直前まで
         stop = len(tail)
         for sw in ANCHOR_STOP_WORDS:
             p = tail.find(sw)
-            if p != -1:
+            if p != -1 and p > 0:
                 stop = min(stop, p)
 
         candidate = tail[:stop]
-        candidate = re.sub(r"[^0-9A-Za-zぁ-んァ-ヶ一-龥々ー・]", "", candidate).strip()
+        # 記号・不要文字を除去（日本語・英数・長音符を残す）
+        candidate = re.sub(r"[^\u0020-\u007E\u3000-\u9FFFー]", "", candidate).strip()
+        candidate = candidate.strip(":：- \t")
 
-        if 2 <= len(candidate) <= 20:
+        if 2 <= len(candidate) <= 30:
+            # 元のテキスト（スペース除去前）での位置を探す
             s = txt.find(candidate, value_start)
-            if s != -1:
+            if s == -1:
+                s = value_start
+                e = value_start + len(candidate)
+            else:
                 e = s + len(candidate)
-                results.append((candidate, out_label, s, e))
+            results.append((candidate, out_label, s, e))
 
     return results
-
-
 
 
 # =====================================================================
@@ -498,11 +500,8 @@ def _iou(a: MaskRegion, b: MaskRegion) -> float:
 
 
 def deduplicate_regions(regions: list[MaskRegion], iou_threshold: float = 0.5) -> list[MaskRegion]:
-    """IoU が閾値以上のリージョンを NER 優先でまとめる（NMS 的処理）。"""
-    # NER を優先（NER を先に並べる）
     priority = {"anchor": 0, "ner": 1, "regex": 2}
     sorted_regions = sorted(regions, key=lambda r: (priority.get(r.source, 9), r.top, r.left))
-
     kept: list[MaskRegion] = []
     suppressed = [False] * len(sorted_regions)
     for i, r in enumerate(sorted_regions):
@@ -570,7 +569,6 @@ def render_anon_labels(
 
     for r in regions:
         x1, y1, x2, y2 = r.left, r.top, r.right, r.bottom
-        # 領域が有効か確認
         if x2 <= x1 or y2 <= y1:
             continue
 
@@ -580,7 +578,6 @@ def render_anon_labels(
         region_w = max(x2 - x1 - 6, 4)
         region_h = max(y2 - y1 - 4, 4)
 
-        # 最適フォントサイズを探索
         best_font = font
         base_size = max(region_h - 2, 8)
         for sz in range(base_size, 7, -1):
@@ -626,7 +623,6 @@ def process_image(
     text_color: tuple = (220, 40, 40),
 ) -> tuple[np.ndarray, list[MaskRegion], list[tuple[str, list[OCRBox]]]]:
 
-    from PIL import ImageFont as PILImageFont
     if target_labels is None:
         target_labels = TARGET_NER_LABELS
 
@@ -638,32 +634,36 @@ def process_image(
     all_regions: list[MaskRegion] = []
 
     for line_text, line_boxes in lines:
-                entities: list[tuple[str, str, int, int, str]] = []
+        entities: list[tuple[str, str, int, int, str]] = []
 
-                # 1) 定型帳票の項目名ベース検出（最優先）
-                anchor_hits = detect_form_anchors(line_text)
-                entities += [(t, l, s, e, "anchor") for t, l, s, e in anchor_hits]
+        # FAX行かどうかを判定（FAX行の電話番号はスキップ）
+        is_fax_line = bool(FAX_LINE_PATTERN.search(line_text))
 
-                # 2) NER
-                if use_ner:
-                    entities += [(t, l, s, e, "ner")
-                                 for t, l, s, e in detect_ner(nlp, line_text, target_labels)]
+        # 1) 定型帳票の項目名ベース検出（最優先）
+        if not is_fax_line:
+            anchor_hits = detect_form_anchors(line_text)
+            entities += [(t, l, s, e, "anchor") for t, l, s, e in anchor_hits]
 
-                # 3) 正規表現
-                if use_regex:
-                    regex_hits = detect_regex(line_text)
+        # 2) NER（GiNZA が有効な場合のみ）
+        if use_ner and nlp is not None:
+            ner_hits = detect_ner(nlp, line_text, target_labels)
+            entities += [(t, l, s, e, "ner") for t, l, s, e in ner_hits]
 
-                    # FAX行にある電話番号は変換しない
-                    if "FAX" in line_text.upper() or "FAX" in line_text:
-                        regex_hits = [x for x in regex_hits if x[1] != "電話番号"]
+        # 3) 正規表現
+        if use_regex:
+            regex_hits = detect_regex(line_text)
+            # FAX行の電話番号は除外
+            if is_fax_line:
+                regex_hits = [x for x in regex_hits if x[1] != "電話番号"]
+            entities += [(t, l, s, e, "regex") for t, l, s, e in regex_hits]
 
-                    entities += [(t, l, s, e, "regex") for t, l, s, e in regex_hits]
-
-                for ent_text, ent_label, cs, ce, src in entities:
-                    anon = anon_mgr.get_anon_label(ent_text, ent_label)
-                    region = map_entity_to_boxes(ent_text, ent_label, anon, cs, ce, line_boxes, source=src)
-                    if region:
-                        all_regions.append(region)
+        for ent_text, ent_label, cs, ce, src in entities:
+            anon = anon_mgr.get_anon_label(ent_text, ent_label)
+            region = map_entity_to_boxes(
+                ent_text, ent_label, anon, cs, ce, line_boxes, source=src
+            )
+            if region:
+                all_regions.append(region)
 
     # 重複排除
     all_regions = deduplicate_regions(all_regions)
@@ -689,7 +689,6 @@ def preprocess_image(image_bgr: np.ndarray, scale: float = 1.0) -> np.ndarray:
 
 
 def scale_regions_back(regions: list[MaskRegion], scale: float) -> list[MaskRegion]:
-    """スケール後の座標を元の画像サイズに戻す。"""
     if scale == 1.0:
         return regions
     scaled = []
@@ -723,7 +722,6 @@ def main() -> None:
         layout="wide",
     )
 
-    # ---- 依存チェック ----
     errors = _check_dependencies()
     if errors:
         st.error("## ⚠️ セットアップが必要です")
@@ -743,7 +741,6 @@ def main() -> None:
 
         st.subheader("検出方法")
         use_ner = st.checkbox("NER（固有表現認識）", value=False, disabled=True)
-
         use_regex = st.checkbox("正規表現ルール", value=True)
 
         if not use_ner and not use_regex:
@@ -813,10 +810,10 @@ def main() -> None:
         st.markdown(
             """
             **対応している個人情報の種類:**
-            - 👤 人名・氏名（GiNZA NER）
-            - 🏢 組織名・会社名
+            - 👤 人名・氏名（帳票項目名ベース検出）
+            - 🏢 組織名・会社名（団体名ラベルベース）
             - 📍 地名・住所
-            - 📞 電話番号（正規表現）
+            - 📞 電話番号（正規表現 ※FAX行は除外）
             - 📮 郵便番号
             - 📧 メールアドレス
             - 📅 生年月日・日付
@@ -832,13 +829,15 @@ def main() -> None:
     progress_bar = st.progress(0, text="処理中…")
 
     for idx, file in enumerate(uploaded):
-        progress_bar.progress((idx) / len(uploaded), text=f"「{file.name}」を処理中… ({idx + 1}/{len(uploaded)})")
+        progress_bar.progress(
+            idx / len(uploaded),
+            text=f"「{file.name}」を処理中… ({idx + 1}/{len(uploaded)})"
+        )
 
         from PIL import Image as PILImage
         pil_image = PILImage.open(file).convert("RGB")
         image_bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
-        # スケール処理（OCR用）
         scaled_bgr = preprocess_image(image_bgr, scale_factor)
 
         masked_scaled, regions_scaled, lines = process_image(
@@ -853,7 +852,6 @@ def main() -> None:
             text_color=text_color,
         )
 
-        # 元スケールに変換して描画し直す
         regions_orig = scale_regions_back(regions_scaled, scale_factor)
         masked = render_anon_labels(image_bgr, regions_orig, font, bg_color, text_color)
 
@@ -865,23 +863,21 @@ def main() -> None:
     for fname, original, masked, regions, lines in results:
         st.markdown(f"---\n### 📄 {fname}")
 
-        # -----------------------------
         # 確認UI: チェックを外すと変換しない
-        # -----------------------------
         if regions:
-            with st.expander(f"🔍 検出・置換結果（{len(regions)} 件）", expanded=True):
-                st.caption("チェックを外すと、その項目は変換しません（FAXや誤検出の除外用）。")
+            with st.expander(f"🔍 検出・置換結果（{len(regions)} 件）— チェックを外すと変換しません", expanded=True):
+                st.caption("FAX番号や誤検出はチェックを外してください。")
 
                 selected_regions = []
                 for i, r in enumerate(regions):
                     method_name = {
-                        "anchor": "項目名ベース",
-                        "ner": "NER",
-                        "regex": "正規表現",
+                        "anchor": "📌 項目名ベース",
+                        "ner":    "🧠 NER",
+                        "regex":  "🔍 正規表現",
                     }.get(r.source, r.source)
 
                     keep = st.checkbox(
-                        f"[{r.label}] {r.original_text} → {r.anon_text} / {method_name}",
+                        f"{method_name}｜[{r.label}]　{r.original_text}　→　{r.anon_text}",
                         value=True,
                         key=f"keep_{fname}_{i}",
                     )
@@ -893,7 +889,9 @@ def main() -> None:
 
         # チェック後のリージョンで再描画
         original_bgr = cv2.cvtColor(np.array(original), cv2.COLOR_RGB2BGR)
-        masked_checked = render_anon_labels(original_bgr, selected_regions, font, bg_color, text_color)
+        masked_checked = render_anon_labels(
+            original_bgr, selected_regions, font, bg_color, text_color
+        )
         masked_rgb = cv2.cvtColor(masked_checked, cv2.COLOR_BGR2RGB)
 
         col1, col2 = st.columns(2)
@@ -909,7 +907,6 @@ def main() -> None:
                 if line_text.strip():
                     st.text(line_text)
 
-        # ダウンロード
         buf = BytesIO()
         from PIL import Image as PILImage
         PILImage.fromarray(masked_rgb).save(buf, format="PNG")
