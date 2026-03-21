@@ -602,9 +602,11 @@ def draw_selection_overlay(
     from PIL import Image as PILImage, ImageDraw
 
     scale  = display_w / orig_w
-    disp_h = int(orig_h * scale)
+    disp_h = int(image_rgb.shape[0] * scale)
 
-    pil_base = PILImage.fromarray(image_rgb).resize((display_w, disp_h))
+    # numpy で先にリサイズしてから PIL に渡す（真っ黒防止）
+    resized = cv2.resize(image_rgb, (display_w, disp_h), interpolation=cv2.INTER_LINEAR)
+    pil_base = PILImage.fromarray(resized)
     overlay  = PILImage.new("RGBA", (display_w, disp_h), (0, 0, 0, 0))
     draw     = ImageDraw.Draw(overlay)
 
@@ -623,9 +625,9 @@ def draw_selection_overlay(
     if point1 is not None:
         px = int(point1[0] * scale)
         py = int(point1[1] * scale)
-        r  = 10
-        draw.line([(px - r, py), (px + r, py)], fill=(0, 200, 0, 255), width=3)
-        draw.line([(px, py - r), (px, py + r)], fill=(0, 200, 0, 255), width=3)
+        arm = 10
+        draw.line([(px - arm, py), (px + arm, py)], fill=(0, 200, 0, 255), width=3)
+        draw.line([(px, py - arm), (px, py + arm)], fill=(0, 200, 0, 255), width=3)
         draw.ellipse([(px - 5, py - 5), (px + 5, py + 5)],
                      outline=(0, 200, 0, 255), width=2)
 
@@ -644,6 +646,7 @@ def draw_selection_overlay(
         pil_base.convert("RGBA"), overlay
     ).convert("RGB")
     return np.array(composite)
+
 
 
 # =====================================================================
