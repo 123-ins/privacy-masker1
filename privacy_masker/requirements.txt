@@ -3,3 +3,4 @@ numpy<2
 pillow
 opencv-python-headless
 pytesseract
+streamlit-drawable-canvas==0.9.3
