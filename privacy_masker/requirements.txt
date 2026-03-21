@@ -3,5 +3,5 @@ numpy
 pillow
 opencv-python-headless
 pytesseract
-streamlit-image-coordinates==0.4.1
+streamlit-image-coordinates
 
