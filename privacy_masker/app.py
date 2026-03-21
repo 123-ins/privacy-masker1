@@ -587,4 +587,543 @@ def apply_mosaic(
 
 
 # =====================================================================
-# 12. プレビュー画像生成（確定済み領域＋選択中マーカー<span class="cursor">█</span>
+# 12. プレビュー画像生成（確定済み領域＋選択中マーカーを重ねる）
+# =====================================================================
+
+def draw_selection_overlay(
+    image_rgb: np.ndarray,
+    point1: Optional[tuple[int, int]],
+    point2: Optional[tuple[int, int]],
+    confirmed_regions: list[MaskRegion],
+    display_w: int,
+    orig_w: int,
+    orig_h: int,
+) -> np.ndarray:
+    from PIL import Image as PILImage, ImageDraw
+
+    scale  = display_w / orig_w
+    disp_h = int(image_rgb.shape[0] * scale)
+
+    # numpy でリサイズ（真っ黒防止）
+    resized  = cv2.resize(image_rgb, (display_w, disp_h),
+                          interpolation=cv2.INTER_LINEAR)
+    pil_base = PILImage.fromarray(resized)
+    overlay  = PILImage.new("RGBA", (display_w, disp_h), (0, 0, 0, 0))
+    draw     = ImageDraw.Draw(overlay)
+
+    # 確定済み領域（赤い半透明）
+    for r in confirmed_regions:
+        rx1 = int(r.left   * scale)
+        ry1 = int(r.top    * scale)
+        rx2 = int(r.right  * scale)
+        ry2 = int(r.bottom * scale)
+        draw.rectangle([rx1, ry1, rx2, ry2],
+                       fill=(255, 0, 0, 90), outline=(255, 0, 0, 220), width=2)
+
+    # 1点目（緑の十字）
+    if point1 is not None:
+        px  = int(point1[0] * scale)
+        py  = int(point1[1] * scale)
+        arm = 12
+        draw.line([(px - arm, py), (px + arm, py)], fill=(0, 220, 0, 255), width=3)
+        draw.line([(px, py - arm), (px, py + arm)], fill=(0, 220, 0, 255), width=3)
+        draw.ellipse([(px - 6, py - 6), (px + 6, py + 6)],
+                     outline=(0, 220, 0, 255), width=2)
+
+    # 2点プレビュー矩形（青）
+    if point1 is not None and point2 is not None:
+        bx1 = int(min(point1[0], point2[0]) * scale)
+        by1 = int(min(point1[1], point2[1]) * scale)
+        bx2 = int(max(point1[0], point2[0]) * scale)
+        by2 = int(max(point1[1], point2[1]) * scale)
+        draw.rectangle([bx1, by1, bx2, by2],
+                       fill=(0, 100, 255, 60), outline=(0, 100, 255, 220), width=2)
+
+    composite = PILImage.alpha_composite(
+        pil_base.convert("RGBA"), overlay
+    ).convert("RGB")
+    return np.array(composite)
+
+
+# =====================================================================
+# 13. メインパイプライン
+# =====================================================================
+
+def process_image(
+    image: np.ndarray,
+    nlp,
+    anon_mgr: AnonymizationManager,
+    use_ner: bool = True,
+    use_regex: bool = True,
+    target_labels: set[str] | None = None,
+    ocr_lang: str = "jpn+eng",
+    conf_threshold: float = 30.0,
+    font=None,
+    bg_color: tuple = (255, 255, 255),
+    text_color: tuple = (220, 40, 40),
+) -> tuple[np.ndarray, list[MaskRegion], list[tuple[str, list[OCRBox]]]]:
+
+    if target_labels is None:
+        target_labels = TARGET_NER_LABELS
+
+    boxes = run_ocr(image, lang=ocr_lang, conf_threshold=conf_threshold)
+    if not boxes:
+        return image.copy(), [], []
+
+    lines = merge_boxes_into_lines(boxes)
+    all_regions: list[MaskRegion] = []
+
+    for line_text, line_boxes in lines:
+        entities: list[tuple[str, str, int, int, str]] = []
+        is_fax_line = bool(FAX_LINE_PATTERN.search(line_text))
+
+        if not is_fax_line:
+            anchor_hits = detect_form_anchors(line_text)
+            entities += [(t, l, s, e, "anchor") for t, l, s, e in anchor_hits]
+
+        if use_ner and nlp is not None:
+            ner_hits = detect_ner(nlp, line_text, target_labels)
+            entities += [(t, l, s, e, "ner") for t, l, s, e in ner_hits]
+
+        if use_regex:
+            regex_hits = detect_regex(line_text)
+            if is_fax_line:
+                regex_hits = [x for x in regex_hits if x[1] != "電話番号"]
+            entities += [(t, l, s, e, "regex") for t, l, s, e in regex_hits]
+
+        for ent_text, ent_label, cs, ce, src in entities:
+            anon = anon_mgr.get_anon_label(ent_text, ent_label)
+            region = map_entity_to_boxes(
+                ent_text, ent_label, anon, cs, ce, line_boxes, source=src
+            )
+            if region:
+                all_regions.append(region)
+
+    all_regions = deduplicate_regions(all_regions)
+    if font is None:
+        font = load_font(20)
+    result = render_anon_labels(image, all_regions, font, bg_color, text_color)
+    return result, all_regions, lines
+
+
+# =====================================================================
+# 14. 前処理・スケール戻し
+# =====================================================================
+
+def preprocess_image(image_bgr: np.ndarray, scale: float = 1.0) -> np.ndarray:
+    if scale != 1.0:
+        h, w = image_bgr.shape[:2]
+        return cv2.resize(image_bgr, (int(w * scale), int(h * scale)),
+                          interpolation=cv2.INTER_CUBIC)
+    return image_bgr
+
+
+def scale_regions_back(regions: list[MaskRegion], scale: float) -> list[MaskRegion]:
+    if scale == 1.0:
+        return regions
+    return [MaskRegion(
+        original_text=r.original_text, label=r.label, anon_text=r.anon_text,
+        left=int(r.left / scale), top=int(r.top / scale),
+        right=int(r.right / scale), bottom=int(r.bottom / scale),
+        source=r.source,
+    ) for r in regions]
+
+
+def hex_to_rgb(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+# =====================================================================
+# 15. Streamlit メイン
+# =====================================================================
+
+def main() -> None:
+    st.set_page_config(
+        page_title="画像プライバシーマスキング",
+        page_icon="🔒",
+        layout="wide",
+    )
+
+    errors = _check_dependencies()
+    if errors:
+        st.error("## ⚠️ セットアップが必要です")
+        for e in errors:
+            st.markdown(e)
+        st.stop()
+
+    st.title("🔒 画像プライバシー匿名化ツール")
+    st.caption("自動検出 ＋ 2点指定モザイク追加。PC はダブルクリック、iPhone は長押しで指定。")
+
+    # ----------------------------------------------------------------
+    # サイドバー
+    # ----------------------------------------------------------------
+    with st.sidebar:
+        st.header("⚙️ 設定")
+
+        st.subheader("検出方法")
+        use_ner   = st.checkbox("NER（固有表現認識）", value=False, disabled=True)
+        use_regex = st.checkbox("正規表現ルール", value=True)
+        if not use_ner and not use_regex:
+            st.warning("少なくとも一方を有効にしてください。")
+        st.caption("現在はNERを一時停止。項目名ベース + 正規表現で動作します。")
+        selected = []
+
+        st.subheader("OCR 設定")
+        ocr_lang = st.text_input("Tesseract 言語コード", value="jpn+eng")
+        conf_threshold = st.slider(
+            "OCR 信頼度の閾値", min_value=0, max_value=90, value=30, step=5
+        )
+        scale_factor = st.select_slider(
+            "画像スケール（大きいほど精度↑）",
+            options=[0.5, 0.75, 1.0, 1.5, 2.0], value=1.0,
+        )
+
+        st.subheader("匿名ラベルの見た目")
+        bg_hex  = st.color_picker("背景色", "#FFFFFF")
+        txt_hex = st.color_picker("文字色", "#DC2828")
+        bg_color   = hex_to_rgb(bg_hex)
+        text_color = hex_to_rgb(txt_hex)
+
+        st.subheader("手動モザイク設定")
+        mosaic_type = st.radio(
+            "モザイクの種類",
+            options=["mosaic", "black"],
+            format_func=lambda x: "🟫 モザイク（ぼかし）" if x == "mosaic" else "⬛ 黒塗り",
+        )
+        mosaic_block = st.slider(
+            "モザイクの粗さ", min_value=5, max_value=40, value=15, step=5
+        )
+
+        st.divider()
+        with st.expander("🔧 Tesseract パス設定（Windows）"):
+            tess_path = st.text_input(
+                "パス", value=r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+            )
+            if st.button("パスを適用"):
+                import pytesseract
+                pytesseract.pytesseract.tesseract_cmd = tess_path
+                st.success("適用しました。")
+
+    nlp  = load_nlp()
+    font = load_font(20)
+
+    # ----------------------------------------------------------------
+    # アップロード
+    # ----------------------------------------------------------------
+    uploaded = st.file_uploader(
+        "画像をアップロード（複数可）",
+        type=["png", "jpg", "jpeg", "tiff", "bmp", "webp"],
+        accept_multiple_files=True,
+    )
+
+    if not uploaded:
+        st.info("👆 画像ファイルをアップロードしてください")
+        st.markdown("""
+**使い方:**
+1. 画像をアップロード
+2. 自動検出結果を確認・チェック調整
+3. 検出漏れは画像を **2回操作** してモザイク範囲を指定
+   - 💻 PC：**ダブルクリック**で1点目 → **ダブルクリック**で2点目
+   - 📱 iPhone：**長押し**で1点目 → **長押し**で2点目
+4. ダウンロード
+""")
+        st.stop()
+
+    anon_mgr = AnonymizationManager()
+    results  = []
+    progress_bar = st.progress(0, text="処理中…")
+
+    for idx, file in enumerate(uploaded):
+        progress_bar.progress(
+            idx / len(uploaded),
+            text=f"処理中… ({idx + 1}/{len(uploaded)})",
+        )
+        from PIL import Image as PILImage
+        pil_image = PILImage.open(file).convert("RGB")
+        image_bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        scaled_bgr = preprocess_image(image_bgr, scale_factor)
+        _, regions_scaled, lines = process_image(
+            scaled_bgr, nlp, anon_mgr,
+            use_ner=use_ner, use_regex=use_regex,
+            target_labels=set(selected) if selected else TARGET_NER_LABELS,
+            ocr_lang=ocr_lang, conf_threshold=float(conf_threshold),
+            font=font, bg_color=bg_color, text_color=text_color,
+        )
+        regions_orig = scale_regions_back(regions_scaled, scale_factor)
+        results.append((file.name, pil_image, image_bgr, regions_orig, lines))
+
+    progress_bar.progress(1.0, text="✅ 完了")
+
+    # ----------------------------------------------------------------
+    # 結果表示ループ
+    # ----------------------------------------------------------------
+    for fname, original_pil, original_bgr, regions, lines in results:
+        st.markdown(f"---\n### 📄 {fname}")
+
+        orig_h, orig_w = original_bgr.shape[:2]
+
+        key_manual   = f"manual_{fname}"
+        key_pt1      = f"pt1_{fname}"
+        key_pt2      = f"pt2_{fname}"
+        key_click_ct = f"click_ct_{fname}"   # クリック回数カウンタ
+
+        for k, v in [
+            (key_manual,   []),
+            (key_pt1,      None),
+            (key_pt2,      None),
+            (key_click_ct, 0),
+        ]:
+            if k not in st.session_state:
+                st.session_state[k] = v
+
+        # ============================================================
+        # STEP 1: 自動検出チェック
+        # ============================================================
+        st.markdown("#### ✅ STEP 1：自動検出の確認")
+        if regions:
+            with st.expander(
+                f"🔍 自動検出結果（{len(regions)} 件）— チェックを外すと変換しません",
+                expanded=True,
+            ):
+                st.caption("FAX番号・誤検出はチェックを外してください。")
+                selected_regions: list[MaskRegion] = []
+                for i, r in enumerate(regions):
+                    method_name = {
+                        "anchor": "📌 項目名ベース",
+                        "ner":    "🧠 NER",
+                        "regex":  "🔍 正規表現",
+                    }.get(r.source, r.source)
+                    keep = st.checkbox(
+                        f"{method_name}｜[{r.label}]　{r.original_text}　→　{r.anon_text}",
+                        value=True,
+                        key=f"keep_{fname}_{i}",
+                    )
+                    if keep:
+                        selected_regions.append(r)
+        else:
+            selected_regions = []
+            st.warning("⚠️ 自動検出ゼロ。STEP 2 で手動追加してください。")
+
+        # ============================================================
+        # STEP 2: 2点指定でモザイク追加
+        # ============================================================
+        st.markdown("#### 🖊️ STEP 2：検出漏れをモザイク追加")
+
+        # 操作ガイド（状態に応じて変化）
+        pt1 = st.session_state[key_pt1]
+        pt2 = st.session_state[key_pt2]
+
+        if pt1 is None:
+            st.info(
+                "💻 PC：隠したい範囲の **左上をダブルクリック**\n\n"
+                "📱 iPhone：隠したい範囲の **左上を長押し**"
+            )
+        elif pt2 is None:
+            st.info(
+                f"✅ 1点目 ({pt1[0]}, {pt1[1]}) を記録しました\n\n"
+                "💻 PC：範囲の **右下をダブルクリック**\n\n"
+                "📱 iPhone：範囲の **右下を長押し**"
+            )
+        else:
+            st.success(
+                f"✅ 範囲プレビュー: "
+                f"({min(pt1[0],pt2[0])}, {min(pt1[1],pt2[1])}) 〜 "
+                f"({max(pt1[0],pt2[0])}, {max(pt1[1],pt2[1])})\n\n"
+                "↓「この範囲をモザイクに追加」ボタンを押してください"
+            )
+
+        # プレビュー画像生成
+        auto_masked_bgr = render_anon_labels(
+            original_bgr, selected_regions, font, bg_color, text_color
+        )
+        auto_masked_rgb = cv2.cvtColor(auto_masked_bgr, cv2.COLOR_BGR2RGB)
+
+        DISPLAY_W = 680
+
+        preview_img = draw_selection_overlay(
+            auto_masked_rgb,
+            st.session_state[key_pt1],
+            st.session_state[key_pt2],
+            st.session_state[key_manual],
+            display_w=DISPLAY_W,
+            orig_w=orig_w,
+            orig_h=orig_h,
+        )
+
+        # ---- streamlit-image-coordinates で座標取得 ----
+        # use_column_width=True にして表示幅を DISPLAY_W に揃える
+        try:
+            from streamlit_image_coordinates import streamlit_image_coordinates
+            from PIL import Image as PILImage as PILImg
+
+            coords = streamlit_image_coordinates(
+                PILImg.fromarray(preview_img),
+                key=f"coords_{fname}",
+            )
+
+            if coords is not None:
+                # 表示座標 → 元画像座標へ変換
+                scale_back = orig_w / DISPLAY_W
+                real_x = int(coords["x"] * scale_back)
+                real_y = int(coords["y"] * scale_back)
+
+                # クリック回数で1点目・2点目を切り替え
+                ct = st.session_state[key_click_ct]
+
+                # 同じ座標の連続反応を無視（誤検知防止）
+                prev_pt = st.session_state[key_pt1] if ct % 2 == 1 else None
+                is_same = (prev_pt is not None and
+                           abs(prev_pt[0] - real_x) < 5 and
+                           abs(prev_pt[1] - real_y) < 5)
+
+                if not is_same:
+                    if st.session_state[key_pt1] is None:
+                        st.session_state[key_pt1] = (real_x, real_y)
+                        st.session_state[key_click_ct] = ct + 1
+                        st.rerun()
+                    elif st.session_state[key_pt2] is None:
+                        st.session_state[key_pt2] = (real_x, real_y)
+                        st.session_state[key_click_ct] = ct + 1
+                        st.rerun()
+
+        except ImportError:
+            st.warning(
+                "⚠️ `streamlit-image-coordinates` が未インストールです。\n"
+                "`requirements.txt` に `streamlit-image-coordinates` を追加して"
+                "再デプロイしてください。"
+            )
+
+        # ---- ボタン3つ ----
+        col_add, col_reset1, col_reset_all = st.columns(3)
+
+        with col_add:
+            if pt1 is not None and pt2 is not None:
+                if st.button(
+                    "✅ この範囲をモザイクに追加",
+                    key=f"confirm_{fname}",
+                    use_container_width=True,
+                ):
+                    new_r = MaskRegion(
+                        original_text=f"manual_{len(st.session_state[key_manual])}",
+                        label="手動",
+                        anon_text="",
+                        left=min(pt1[0], pt2[0]),
+                        top=min(pt1[1], pt2[1]),
+                        right=max(pt1[0], pt2[0]),
+                        bottom=max(pt1[1], pt2[1]),
+                        source="manual",
+                    )
+                    st.session_state[key_manual].append(new_r)
+                    st.session_state[key_pt1]      = None
+                    st.session_state[key_pt2]      = None
+                    st.session_state[key_click_ct] = 0
+                    st.rerun()
+
+        with col_reset1:
+            if st.button(
+                "↩️ 選択をやり直す",
+                key=f"reset1_{fname}",
+                use_container_width=True,
+            ):
+                st.session_state[key_pt1]      = None
+                st.session_state[key_pt2]      = None
+                st.session_state[key_click_ct] = 0
+                st.rerun()
+
+        with col_reset_all:
+            if st.button(
+                "🗑️ 手動追加を全削除",
+                key=f"reset_all_{fname}",
+                use_container_width=True,
+            ):
+                st.session_state[key_manual]   = []
+                st.session_state[key_pt1]      = None
+                st.session_state[key_pt2]      = None
+                st.session_state[key_click_ct] = 0
+                st.rerun()
+
+        # ---- 追加済みリスト ----
+        manual_regions: list[MaskRegion] = st.session_state[key_manual]
+        if manual_regions:
+            with st.expander(
+                f"📋 追加済み手動モザイク（{len(manual_regions)} 件）",
+                expanded=False,
+            ):
+                for mi, mr in enumerate(manual_regions):
+                    col_i, col_d = st.columns([5, 1])
+                    with col_i:
+                        st.caption(
+                            f"#{mi + 1}　"
+                            f"左:{mr.left} 上:{mr.top} 右:{mr.right} 下:{mr.bottom}"
+                        )
+                    with col_d:
+                        if st.button("🗑️", key=f"del_{fname}_{mi}"):
+                            st.session_state[key_manual].pop(mi)
+                            st.rerun()
+
+        # ============================================================
+        # STEP 3: 最終画像生成・表示・ダウンロード
+        # ============================================================
+        st.markdown("#### 🖼️ STEP 3：最終プレビュー＆ダウンロード")
+
+        final_bgr = render_anon_labels(
+            original_bgr, selected_regions, font, bg_color, text_color
+        )
+        final_bgr = apply_mosaic(
+            final_bgr, manual_regions,
+            mosaic_type=mosaic_type, block_size=mosaic_block,
+        )
+        final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**元画像**")
+            st.image(original_pil, use_container_width=True)
+        with col2:
+            st.markdown("**匿名化後（自動＋手動モザイク）**")
+            st.image(final_rgb, use_container_width=True)
+
+        with st.expander("📝 OCR テキスト（デバッグ用）"):
+            for line_text, _ in lines:
+                if line_text.strip():
+                    st.text(line_text)
+
+        from PIL import Image as PILImage
+        buf = BytesIO()
+        PILImage.fromarray(final_rgb).save(buf, format="PNG")
+        st.download_button(
+            label=f"⬇️ {fname} の匿名化画像をダウンロード",
+            data=buf.getvalue(),
+            file_name=f"anon_{fname.rsplit('.', 1)[0]}.png",
+            mime="image/png",
+            key=f"dl_{fname}",
+        )
+
+    # ----------------------------------------------------------------
+    # マッピングテーブル
+    # ----------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("📋 匿名化マッピング一覧")
+    st.caption("⚠️ この対応表は自分専用で保管し、第三者には絶対に共有しないでください。")
+    mapping = anon_mgr.get_mapping_table()
+    if mapping:
+        st.table(mapping)
+        text_buf = io.StringIO()
+        writer = csv.DictWriter(
+            text_buf, fieldnames=["カテゴリ", "元テキスト", "匿名ラベル"]
+        )
+        writer.writeheader()
+        writer.writerows(mapping)
+        st.download_button(
+            label="⬇️ マッピング表を CSV でダウンロード",
+            data=text_buf.getvalue().encode("utf-8-sig"),
+            file_name="anonymization_mapping.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("検出された固有表現がないため、マッピングはありません。")
+
+
+if __name__ == "__main__":
+    main()
