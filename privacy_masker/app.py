@@ -372,8 +372,6 @@ TARGET_NER_LABELS: set[str] = {
     "LOC", "Location", "GPE", "FAC", "Facility",
 }
 
-}
-
 REGEX_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("電話番号",       re.compile(r"0\d{1,4}[-ー]?\d{1,4}[-ー]?\d{3,4}")),
     ("郵便番号",       re.compile(r"〒?\d{3}[-ー]\d{4}")),
