@@ -408,9 +408,12 @@ EMAIL_RE_STRICT = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
 FORM_LABEL_RULES: dict[str, str] = {
     "担当者名": "Person",
     "氏名": "Person",
+    "住所": "住所",
+    "所在地": "住所",
     "電話番号": "電話番号",
     "メールアドレス": "メール",
 }
+
 
 ANCHOR_STOP_WORDS = [
     "FAX", "ＦＡＸ",
