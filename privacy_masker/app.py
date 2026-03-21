@@ -959,9 +959,10 @@ def main() -> None:
 
 
             coords = streamlit_image_coordinates(
-                PILImg.fromarray(preview_img),
+                PILImage.fromarray(preview_img),
                 key=f"coords_{fname}",
             )
+
 
             if coords is not None:
                 # 表示座標 → 元画像座標へ変換
