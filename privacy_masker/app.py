@@ -1,18 +1,11 @@
 """
 app.py – 画像内の個人情報を匿名化ラベルで置換する Streamlit アプリ
 ====================================================================
-・人名      → A, B, C, ... Z, AA, AB, ...
-・地名      → 地点あ, 地点い, 地点う, ...
-・電話番号  → 000-0000-0001, 000-0000-0002, ...
-・郵便番号  → 〒000-0001, 〒000-0002, ...
-・メール    → anonymous001@example.com, ...
-・組織      → 組織ア, 組織イ, 組織ウ, ...
-・その他    → XXX-001, XXX-002, ...
-
-同一の元テキストには必ず同じ仮名ラベルが割り当てられます。
-手書き領域追加機能付き（自動検出後に手動でマスク範囲を追加可能）
-
-使い方: streamlit run app.py
+iPhone Safari 完全対応版
+・自動検出（帳票項目名ベース + 正規表現）
+・検出漏れは「行指定」または「座標入力」でモザイク追加
+・FAX行の電話番号は自動除外
+・〜 記号は変換しない
 """
 
 from __future__ import annotations
@@ -43,9 +36,7 @@ def _check_dependencies() -> list[str]:
     except Exception:
         errors.append(
             "❌ **Tesseract が見つかりません。**\n"
-            "- Ubuntu: `sudo apt-get install tesseract-ocr tesseract-ocr-jpn`\n"
-            "- macOS: `brew install tesseract tesseract-lang`\n"
-            "- Windows: インストール後に下のパス設定から設定してください。"
+            "- Ubuntu: `sudo apt-get install tesseract-ocr tesseract-ocr-jpn`"
         )
     return errors
 
@@ -538,7 +529,7 @@ def map_entity_to_boxes(
 
 
 # =====================================================================
-# 10. 描画
+# 10. 匿名ラベル描画
 # =====================================================================
 
 def render_anon_labels(
@@ -559,7 +550,6 @@ def render_anon_labels(
         x1, y1, x2, y2 = r.left, r.top, r.right, r.bottom
         if x2 <= x1 or y2 <= y1:
             continue
-
         draw.rectangle([x1, y1, x2, y2], fill=bg_color, outline=border_color, width=2)
 
         label = r.anon_text
@@ -591,6 +581,47 @@ def render_anon_labels(
         draw.text((tx, ty), label, font=best_font, fill=text_color)
 
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
+# =====================================================================
+# 10b. モザイク描画（手動追加領域用）
+# =====================================================================
+
+def apply_mosaic(
+    image: np.ndarray,
+    regions: list[MaskRegion],
+    mosaic_type: str = "mosaic",   # "mosaic" or "black"
+    block_size: int = 15,
+) -> np.ndarray:
+    """
+    手動追加領域にモザイク or 黒塗りを適用する。
+    自動検出領域（source != "manual"）はスキップ（render_anon_labels で処理済み）。
+    """
+    result = image.copy()
+    for r in regions:
+        if r.source != "manual":
+            continue
+        x1 = max(r.left, 0)
+        y1 = max(r.top, 0)
+        x2 = min(r.right, image.shape[1])
+        y2 = min(r.bottom, image.shape[0])
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        if mosaic_type == "black":
+            result[y1:y2, x1:x2] = 0
+        else:
+            roi = result[y1:y2, x1:x2]
+            roi_h, roi_w = roi.shape[:2]
+            bw = max(block_size, 1)
+            bh = max(block_size, 1)
+            small = cv2.resize(roi, (max(roi_w // bw, 1), max(roi_h // bh, 1)),
+                               interpolation=cv2.INTER_LINEAR)
+            mosaic_roi = cv2.resize(small, (roi_w, roi_h),
+                                    interpolation=cv2.INTER_NEAREST)
+            result[y1:y2, x1:x2] = mosaic_roi
+
+    return result
 
 
 # =====================================================================
@@ -692,77 +723,71 @@ def scale_regions_back(regions: list[MaskRegion], scale: float) -> list[MaskRegi
 
 
 # =====================================================================
-# 13. 手書き矩形 → MaskRegion 変換
+# 13. グリッド付きプレビュー画像生成
 # =====================================================================
 
-MANUAL_LABEL_OPTIONS: dict[str, str] = {
-    "人名":     "Person",
-    "電話番号": "電話番号",
-    "メール":   "メール",
-    "住所":     "住所",
-    "組織名":   "ORG",
-    "その他":   "other",
-}
-
-
-def canvas_rects_to_regions(
-    canvas_data,
-    anon_mgr: AnonymizationManager,
-    entity_label: str,
-    display_w: int,
-    display_h: int,
-    orig_w: int,
-    orig_h: int,
-) -> list[MaskRegion]:
+def make_grid_preview(
+    image_rgb: np.ndarray,
+    grid_cols: int = 10,
+    grid_rows: int = 20,
+) -> np.ndarray:
     """
-    streamlit-drawable-canvas の描画データ（JSON）から
-    MaskRegion のリストを作る。
-    キャンバス表示サイズ → 元画像サイズ へ座標を変換する。
+    行・列番号入りのグリッドを重ねたプレビュー画像を返す。
+    ユーザーが「何行目・何列目」を指定する際の目安用。
     """
-    regions = []
-    if canvas_data is None or canvas_data.json_data is None:
-        return regions
+    from PIL import Image as PILImage, ImageDraw, ImageFont as PILImageFont
 
-    objects = canvas_data.json_data.get("objects", [])
-    scale_x = orig_w / display_w
-    scale_y = orig_h / display_h
+    h, w = image_rgb.shape[:2]
+    pil_img = PILImage.fromarray(image_rgb).convert("RGBA")
 
-    for i, obj in enumerate(objects):
-        if obj.get("type") != "rect":
-            continue
-        # fabric.js の座標系（left/top はスケール前）
-        left  = int(obj.get("left", 0) * scale_x)
-        top   = int(obj.get("top",  0) * scale_y)
-        w     = int(obj.get("width",  0) * obj.get("scaleX", 1) * scale_x)
-        h     = int(obj.get("height", 0) * obj.get("scaleY", 1) * scale_y)
-        right  = left + w
-        bottom = top  + h
+    # 半透明オーバーレイ
+    overlay = PILImage.new("RGBA", pil_img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
 
-        if w < 5 or h < 5:
-            continue
+    col_w = w / grid_cols
+    row_h = h / grid_rows
 
-        label_key = f"manual_{i}"
-        anon = anon_mgr.get_anon_label(label_key, entity_label)
+    # グリッド線
+    for c in range(grid_cols + 1):
+        x = int(c * col_w)
+        draw.line([(x, 0), (x, h)], fill=(255, 0, 0, 60), width=1)
+    for r in range(grid_rows + 1):
+        y = int(r * row_h)
+        draw.line([(0, y), (w, y)], fill=(255, 0, 0, 60), width=1)
 
-        regions.append(MaskRegion(
-            original_text=label_key,
-            label=entity_label,
-            anon_text=anon,
-            left=left, top=top,
-            right=right, bottom=bottom,
-            source="manual",
-        ))
-    return regions
+    # 行番号（左端）
+    try:
+        fnt = PILImageFont.truetype(
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 14
+        )
+    except Exception:
+        fnt = PILImageFont.load_default()
+
+    for r in range(grid_rows):
+        y = int(r * row_h) + 2
+        draw.text((2, y), str(r + 1), font=fnt, fill=(255, 0, 0, 180))
+
+    # 列番号（上端）
+    for c in range(grid_cols):
+        x = int(c * col_w) + 2
+        draw.text((x, 2), str(c + 1), font=fnt, fill=(255, 0, 0, 180))
+
+    composite = PILImage.alpha_composite(pil_img, overlay).convert("RGB")
+    return np.array(composite)
 
 
 # =====================================================================
-# 14. Streamlit UI
+# 14. Streamlit UI ヘルパー
 # =====================================================================
 
 def hex_to_rgb(h: str) -> tuple[int, int, int]:
     h = h.lstrip("#")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
+
+# =====================================================================
+# 15. Streamlit メイン UI
+# =====================================================================
 
 def main() -> None:
     st.set_page_config(
@@ -780,11 +805,12 @@ def main() -> None:
 
     st.title("🔒 画像プライバシー匿名化ツール")
     st.caption(
-        "画像内の人名・地名・電話番号等を自動検出して匿名ラベルで置換します。\n"
-        "検出漏れは手書き矩形で追加できます。FAX行の電話番号は自動除外されます。"
+        "自動検出 ＋ 手動モザイク追加に対応。iPhone Safari でも使えます。"
     )
 
-    # ---- サイドバー ----
+    # ================================================================
+    # サイドバー
+    # ================================================================
     with st.sidebar:
         st.header("⚙️ 設定")
 
@@ -794,8 +820,7 @@ def main() -> None:
         if not use_ner and not use_regex:
             st.warning("少なくとも一方を有効にしてください。")
 
-        st.subheader("NER ラベル選択")
-        st.caption("Cloud互換のため、現在はNERを一時停止中。項目名ベース検出 + 正規表現で動作します。")
+        st.caption("Cloud互換のため、現在はNERを一時停止中。項目名ベース + 正規表現で動作します。")
         selected = []
 
         st.subheader("OCR 設定")
@@ -816,6 +841,18 @@ def main() -> None:
         bg_color   = hex_to_rgb(bg_hex)
         text_color = hex_to_rgb(txt_hex)
 
+        st.subheader("手動モザイク設定")
+        mosaic_type = st.radio(
+            "モザイクの種類",
+            options=["mosaic", "black"],
+            format_func=lambda x: "🟫 モザイク（ぼかし）" if x == "mosaic" else "⬛ 黒塗り",
+            index=0,
+        )
+        mosaic_block = st.slider(
+            "モザイクの粗さ（大きいほど荒い）",
+            min_value=5, max_value=40, value=15, step=5,
+        )
+
         st.divider()
         st.markdown(
             "**匿名ラベル凡例**\n\n"
@@ -825,7 +862,6 @@ def main() -> None:
             "| 地名 | 地点あ, 地点い … |\n"
             "| 組織 | 組織ア, 組織イ … |\n"
             "| 電話番号 | 000-0000-0001 … |\n"
-            "| 郵便番号 | 〒000-0001 … |\n"
             "| メール | anonymous001@… |\n"
         )
 
@@ -840,11 +876,15 @@ def main() -> None:
                 pytesseract.pytesseract.tesseract_cmd = tess_path
                 st.success("パスを適用しました。")
 
-    # ---- フォント・モデル ----
+    # ================================================================
+    # フォント・モデル読み込み
+    # ================================================================
     nlp  = load_nlp()
     font = load_font(20)
 
-    # ---- アップロード ----
+    # ================================================================
+    # アップロード
+    # ================================================================
     uploaded = st.file_uploader(
         "画像をアップロード（複数可）",
         type=["png", "jpg", "jpeg", "tiff", "bmp", "webp"],
@@ -852,25 +892,22 @@ def main() -> None:
     )
 
     if not uploaded:
-        st.info("👆 画像ファイルをアップロードしてください（PNG / JPG / TIFF 等）")
+        st.info("👆 画像ファイルをアップロードしてください")
         st.markdown(
             """
-            **対応している個人情報の種類:**
-            - 👤 人名・氏名（帳票項目名ベース）
-            - 🏢 組織名・団体名
-            - 📍 住所・所在地
-            - 📞 電話番号（FAX行は自動除外）
-            - 📧 メールアドレス
-            - 📮 郵便番号
-            - 🖊️ 自動検出漏れ → 手書き矩形で追加可能
+            **このアプリでできること:**
+            - 👤 人名・担当者名・氏名を自動検出してラベル置換
+            - 📞 電話番号を自動検出（FAX行は自動除外）
+            - 📧 メールアドレスを自動検出
+            - 🏢 団体名・組織名を自動検出
+            - 🖊️ 検出漏れは **行番号指定** または **座標入力** でモザイク追加
+            - 📱 iPhone Safari でも使用可能
             """
         )
         st.stop()
 
-    # 全画像共有の匿名化マネージャー
     anon_mgr = AnonymizationManager()
-
-    results = []
+    results  = []
     progress_bar = st.progress(0, text="処理中…")
 
     for idx, file in enumerate(uploaded):
@@ -903,16 +940,17 @@ def main() -> None:
     progress_bar.progress(1.0, text="✅ 全ファイル処理完了")
 
     # ================================================================
-    # 結果表示 + 手書き追加UI
+    # 結果表示ループ
     # ================================================================
     for fname, original_pil, original_bgr, regions, lines in results:
         st.markdown(f"---\n### 📄 {fname}")
 
         orig_h, orig_w = original_bgr.shape[:2]
 
-        # --------------------------------------------------
-        # ① 自動検出チェックUI
-        # --------------------------------------------------
+        # -------------------------------------------------------
+        # STEP 1: 自動検出チェック
+        # -------------------------------------------------------
+        st.markdown("#### ✅ STEP 1：自動検出の確認")
         if regions:
             with st.expander(
                 f"🔍 自動検出結果（{len(regions)} 件）— チェックを外すと変換しません",
@@ -926,7 +964,6 @@ def main() -> None:
                         "ner":    "🧠 NER",
                         "regex":  "🔍 正規表現",
                     }.get(r.source, r.source)
-
                     keep = st.checkbox(
                         f"{method_name}｜[{r.label}]　{r.original_text}　→　{r.anon_text}",
                         value=True,
@@ -936,122 +973,184 @@ def main() -> None:
                         selected_regions.append(r)
         else:
             selected_regions = []
-            st.warning("⚠️ 自動検出ゼロ。手書きで範囲を追加してください。")
+            st.warning("⚠️ 自動検出ゼロ。STEP 2 で手動追加してください。")
 
-        # --------------------------------------------------
-        # ② 手書き追加UI
-        # --------------------------------------------------
-        st.markdown("#### ✏️ 手書きで追加マスク（検出漏れ用）")
-        st.caption(
-            "下の画像上でマウスをドラッグして四角を描いてください。"
-            "複数描けます。描き終わったら「カテゴリ」を選んで「追加して再描画」ボタンを押してください。"
-        )
+        # -------------------------------------------------------
+        # STEP 2: 手動モザイク追加
+        # -------------------------------------------------------
+        st.markdown("#### 🖊️ STEP 2：検出漏れを手動でモザイク追加")
 
-        # キャンバス表示幅（画面幅に合わせて調整）
-        CANVAS_DISPLAY_W = 700
-        canvas_scale = CANVAS_DISPLAY_W / orig_w
-        CANVAS_DISPLAY_H = int(orig_h * canvas_scale)
-
-        # キャンバス背景用に自動検出済み画像を作成
+        # グリッドプレビュー
         auto_masked_bgr = render_anon_labels(
             original_bgr, selected_regions, font, bg_color, text_color
         )
         auto_masked_rgb = cv2.cvtColor(auto_masked_bgr, cv2.COLOR_BGR2RGB)
 
-        from PIL import Image as PILImage
-        canvas_bg_pil = PILImage.fromarray(auto_masked_rgb).resize(
-            (CANVAS_DISPLAY_W, CANVAS_DISPLAY_H)
-        )
+        GRID_ROWS = 20
+        GRID_COLS = 10
 
-        # drawable-canvas
-        try:
-            from streamlit_drawable_canvas import st_canvas
-
-            col_canvas, col_ctrl = st.columns([3, 1])
-
-            with col_ctrl:
-                st.markdown("**追加するカテゴリ**")
-                manual_label_jp = st.selectbox(
-                    "カテゴリ選択",
-                    options=list(MANUAL_LABEL_OPTIONS.keys()),
-                    key=f"manual_label_{fname}",
-                    label_visibility="collapsed",
-                )
-                manual_label = MANUAL_LABEL_OPTIONS[manual_label_jp]
-
-                st.markdown("**描画色**")
-                draw_color = st.color_picker(
-                    "矩形の色",
-                    "#FF0000",
-                    key=f"draw_color_{fname}",
-                    label_visibility="collapsed",
-                )
-
-                st.markdown(" ")
-                add_button = st.button(
-                    "✅ 手書き領域を追加して\n再描画",
-                    key=f"add_manual_{fname}",
-                    use_container_width=True,
-                )
-                st.caption("※ボタンを押すまで追加されません")
-
-            with col_canvas:
-                canvas_result = st_canvas(
-                    fill_color="rgba(255, 0, 0, 0.15)",
-                    stroke_width=2,
-                    stroke_color=draw_color,
-                    background_image=canvas_bg_pil,
-                    update_streamlit=True,
-                    height=CANVAS_DISPLAY_H,
-                    width=CANVAS_DISPLAY_W,
-                    drawing_mode="rect",
-                    key=f"canvas_{fname}",
-                )
-
-            # ボタンが押されたら手書き領域を統合
-            if add_button:
-                manual_regions = canvas_rects_to_regions(
-                    canvas_result,
-                    anon_mgr,
-                    manual_label,
-                    display_w=CANVAS_DISPLAY_W,
-                    display_h=CANVAS_DISPLAY_H,
-                    orig_w=orig_w,
-                    orig_h=orig_h,
-                )
-                all_final_regions = deduplicate_regions(
-                    selected_regions + manual_regions
-                )
-                if manual_regions:
-                    st.success(f"✅ 手書き領域 {len(manual_regions)} 件を追加しました！")
-                else:
-                    st.info("手書き領域が検出されませんでした。四角を描いてから押してください。")
-            else:
-                all_final_regions = selected_regions
-
-        except ImportError:
-            # streamlit-drawable-canvas が入っていない場合のフォールバック
-            st.warning(
-                "⚠️ `streamlit-drawable-canvas` がインストールされていません。\n"
-                "`requirements.txt` に `streamlit-drawable-canvas==0.9.3` を追加して再デプロイしてください。"
+        with st.expander("🗺️ グリッド付き位置確認マップを表示（行・列番号の目安）", expanded=False):
+            grid_img = make_grid_preview(auto_masked_rgb, grid_cols=GRID_COLS, grid_rows=GRID_ROWS)
+            st.image(grid_img, caption="赤数字：上＝列番号 / 左＝行番号", use_container_width=True)
+            st.caption(
+                f"画像サイズ: {orig_w} × {orig_h} px　"
+                f"｜ 1行 ≈ {orig_h // GRID_ROWS} px　"
+                f"｜ 1列 ≈ {orig_w // GRID_COLS} px"
             )
-            all_final_regions = selected_regions
 
-        # --------------------------------------------------
-        # ③ 最終画像を描画して表示
-        # --------------------------------------------------
-        final_masked_bgr = render_anon_labels(
-            original_bgr, all_final_regions, font, bg_color, text_color
+        # セッション状態で手動領域リストを保持
+        manual_key = f"manual_regions_{fname}"
+        if manual_key not in st.session_state:
+            st.session_state[manual_key] = []
+
+        # ---- 入力方式タブ ----
+        tab_row, tab_coord = st.tabs(["📋 行番号で指定", "📐 座標（px）で指定"])
+
+        # ==============================
+        # タブ①：行番号指定
+        # ==============================
+        with tab_row:
+            st.caption(
+                "上のグリッドマップで確認した行番号を入力してください。"
+                "「行の高さ余白」を広げると上下に広くマスクできます。"
+            )
+            col_r1, col_r2, col_r3 = st.columns(3)
+            with col_r1:
+                row_start = st.number_input(
+                    "開始行番号", min_value=1, max_value=GRID_ROWS,
+                    value=1, step=1, key=f"row_start_{fname}"
+                )
+            with col_r2:
+                row_end = st.number_input(
+                    "終了行番号", min_value=1, max_value=GRID_ROWS,
+                    value=1, step=1, key=f"row_end_{fname}"
+                )
+            with col_r3:
+                row_margin = st.number_input(
+                    "上下余白(px)", min_value=0, max_value=50,
+                    value=5, step=1, key=f"row_margin_{fname}"
+                )
+
+            col_rc1, col_rc2 = st.columns(2)
+            with col_rc1:
+                col_start = st.number_input(
+                    "開始列番号（省略可：1）",
+                    min_value=1, max_value=GRID_COLS,
+                    value=1, step=1, key=f"col_start_{fname}"
+                )
+            with col_rc2:
+                col_end = st.number_input(
+                    "終了列番号（省略可：最大）",
+                    min_value=1, max_value=GRID_COLS,
+                    value=GRID_COLS, step=1, key=f"col_end_{fname}"
+                )
+
+            if st.button("➕ この行範囲を追加", key=f"add_row_{fname}"):
+                row_h_px = orig_h / GRID_ROWS
+                col_w_px = orig_w / GRID_COLS
+                top_px    = max(int((row_start - 1) * row_h_px) - row_margin, 0)
+                bottom_px = min(int(row_end * row_h_px) + row_margin, orig_h)
+                left_px   = max(int((col_start - 1) * col_w_px), 0)
+                right_px  = min(int(col_end * col_w_px), orig_w)
+
+                new_r = MaskRegion(
+                    original_text=f"manual_row_{len(st.session_state[manual_key])}",
+                    label="手動",
+                    anon_text="",
+                    left=left_px, top=top_px,
+                    right=right_px, bottom=bottom_px,
+                    source="manual",
+                )
+                st.session_state[manual_key].append(new_r)
+                st.success(
+                    f"✅ 行 {row_start}〜{row_end}、列 {col_start}〜{col_end} を追加しました！"
+                )
+
+        # ==============================
+        # タブ②：座標（px）指定
+        # ==============================
+        with tab_coord:
+            st.caption(
+                "グリッドマップの「1行 ≈ ○px」を参考に、直接ピクセル座標を入力できます。"
+                "より細かい範囲指定が必要なときに使ってください。"
+            )
+            col_c1, col_c2 = st.columns(2)
+            with col_c1:
+                px_left = st.number_input(
+                    "左端 (px)", min_value=0, max_value=orig_w,
+                    value=0, step=10, key=f"px_left_{fname}"
+                )
+                px_top = st.number_input(
+                    "上端 (px)", min_value=0, max_value=orig_h,
+                    value=0, step=10, key=f"px_top_{fname}"
+                )
+            with col_c2:
+                px_right = st.number_input(
+                    "右端 (px)", min_value=0, max_value=orig_w,
+                    value=orig_w, step=10, key=f"px_right_{fname}"
+                )
+                px_bottom = st.number_input(
+                    "下端 (px)", min_value=0, max_value=orig_h,
+                    value=100, step=10, key=f"px_bottom_{fname}"
+                )
+
+            if st.button("➕ この座標範囲を追加", key=f"add_coord_{fname}"):
+                if px_right > px_left and px_bottom > px_top:
+                    new_r = MaskRegion(
+                        original_text=f"manual_coord_{len(st.session_state[manual_key])}",
+                        label="手動",
+                        anon_text="",
+                        left=px_left, top=px_top,
+                        right=px_right, bottom=px_bottom,
+                        source="manual",
+                    )
+                    st.session_state[manual_key].append(new_r)
+                    st.success(
+                        f"✅ 座標 ({px_left},{px_top})〜({px_right},{px_bottom}) を追加しました！"
+                    )
+                else:
+                    st.error("右端 > 左端、下端 > 上端 になるように入力してください。")
+
+        # ---- 追加済み手動領域の一覧＋削除 ----
+        manual_regions: list[MaskRegion] = st.session_state[manual_key]
+        if manual_regions:
+            st.markdown(f"**追加済み手動領域：{len(manual_regions)} 件**")
+            for mi, mr in enumerate(manual_regions):
+                col_info, col_del = st.columns([4, 1])
+                with col_info:
+                    st.caption(
+                        f"#{mi + 1}　左:{mr.left} 上:{mr.top} 右:{mr.right} 下:{mr.bottom}"
+                    )
+                with col_del:
+                    if st.button("🗑️", key=f"del_manual_{fname}_{mi}"):
+                        st.session_state[manual_key].pop(mi)
+                        st.rerun()
+
+        # -------------------------------------------------------
+        # STEP 3: 最終画像を生成・表示
+        # -------------------------------------------------------
+        st.markdown("#### 🖼️ STEP 3：最終プレビュー＆ダウンロード")
+
+        # 自動検出 → ラベル描画
+        final_bgr = render_anon_labels(
+            original_bgr, selected_regions, font, bg_color, text_color
         )
-        final_masked_rgb = cv2.cvtColor(final_masked_bgr, cv2.COLOR_BGR2RGB)
+        # 手動領域 → モザイク描画
+        final_bgr = apply_mosaic(
+            final_bgr,
+            manual_regions,
+            mosaic_type=mosaic_type,
+            block_size=mosaic_block,
+        )
+        final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
 
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("**元画像**")
             st.image(original_pil, use_container_width=True)
         with col2:
-            st.markdown("**匿名化後（手書き追加込み）**")
-            st.image(final_masked_rgb, use_container_width=True)
+            st.markdown("**匿名化後（自動＋手動）**")
+            st.image(final_rgb, use_container_width=True)
 
         with st.expander("📝 OCR テキスト（デバッグ用）"):
             for line_text, _ in lines:
@@ -1059,8 +1158,9 @@ def main() -> None:
                     st.text(line_text)
 
         # ダウンロード
+        from PIL import Image as PILImage
         buf = BytesIO()
-        PILImage.fromarray(final_masked_rgb).save(buf, format="PNG")
+        PILImage.fromarray(final_rgb).save(buf, format="PNG")
         st.download_button(
             label=f"⬇️ {fname} の匿名化画像をダウンロード",
             data=buf.getvalue(),
@@ -1069,7 +1169,9 @@ def main() -> None:
             key=f"dl_{fname}",
         )
 
-    # ---- マッピングテーブル ----
+    # ================================================================
+    # マッピングテーブル
+    # ================================================================
     st.markdown("---")
     st.subheader("📋 匿名化マッピング一覧（全画像共通）")
     st.caption("⚠️ この対応表は自分専用で保管し、第三者には絶対に共有しないでください。")
