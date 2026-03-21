@@ -10,6 +10,7 @@ app.py – 画像内の個人情報を匿名化ラベルで置換する Streamli
 ・その他    → XXX-001, XXX-002, ...
 
 同一の元テキストには必ず同じ仮名ラベルが割り当てられます。
+手書き領域追加機能付き（自動検出後に手動でマスク範囲を追加可能）
 
 使い方: streamlit run app.py
 """
@@ -21,8 +22,7 @@ import io
 import os
 import re
 import subprocess
-import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from io import BytesIO
 from typing import Optional
 
@@ -32,7 +32,7 @@ import streamlit as st
 
 
 # =====================================================================
-# 0. 起動時チェック（Tesseract / spaCy / GiNZA）
+# 0. 起動時チェック
 # =====================================================================
 
 def _check_dependencies() -> list[str]:
@@ -45,8 +45,7 @@ def _check_dependencies() -> list[str]:
             "❌ **Tesseract が見つかりません。**\n"
             "- Ubuntu: `sudo apt-get install tesseract-ocr tesseract-ocr-jpn`\n"
             "- macOS: `brew install tesseract tesseract-lang`\n"
-            "- Windows: [GitHub releases](https://github.com/UB-Mannheim/tesseract/wiki) からインストール後、"
-            "`pytesseract.pytesseract.tesseract_cmd` にパスを設定してください。"
+            "- Windows: インストール後に下のパス設定から設定してください。"
         )
     return errors
 
@@ -110,7 +109,6 @@ class AnonymizationManager:
         "あいうえおかきくけこさしすせそたちつてとなにぬねの"
         "はひふへほまみむめもやゆよらりるれろわをん"
     )
-
     _KATAKANA = list(
         "アイウエオカキクケコサシスセソタチツテトナニヌネノ"
         "ハヒフヘホマミムメモヤユヨラリルレロワヲン"
@@ -179,7 +177,7 @@ class AnonymizationManager:
     def __init__(self) -> None:
         self._cache: dict[str, dict[str, str]] = {}
         self._counters: dict[str, int] = {}
-        self._generators: dict[str, callable] = {
+        self._generators = {
             "person":   self._person_label,
             "location": self._location_label,
             "org":      self._org_label,
@@ -220,7 +218,7 @@ class AnonymizationManager:
 
 
 # =====================================================================
-# 3. spaCy (GiNZA) キャッシュ読み込み
+# 3. spaCy キャッシュ（現在は無効）
 # =====================================================================
 
 @st.cache_resource
@@ -229,7 +227,7 @@ def load_nlp():
 
 
 # =====================================================================
-# 4. 日本語フォント読み込み（PIL 描画用）
+# 4. 日本語フォント読み込み
 # =====================================================================
 
 @st.cache_resource
@@ -290,7 +288,11 @@ def get_sized_font(base_font, size: int):
 # 5. OCR
 # =====================================================================
 
-def run_ocr(image: np.ndarray, lang: str = "jpn+eng", conf_threshold: float = 30.0) -> list[OCRBox]:
+def run_ocr(
+    image: np.ndarray,
+    lang: str = "jpn+eng",
+    conf_threshold: float = 30.0,
+) -> list[OCRBox]:
     import pytesseract
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     binary = cv2.adaptiveThreshold(
@@ -346,7 +348,7 @@ def merge_boxes_into_lines(
 
 
 # =====================================================================
-# 7. 正規表現・項目名ベース検出
+# 7. 検出ロジック
 # =====================================================================
 
 TARGET_NER_LABELS: set[str] = {
@@ -355,13 +357,13 @@ TARGET_NER_LABELS: set[str] = {
     "LOC", "Location", "GPE", "FAC", "Facility",
 }
 
-# 電話番号: ハイフンにI(アイ)が混入するケースも考慮
 PHONE_RE_STRICT = re.compile(
     r"(?<!\d)0\d{1,4}[-ーI\-−‐]\d{1,4}[-ーI\-−‐]\d{3,4}(?!\d)"
 )
 EMAIL_RE_STRICT = re.compile(
     r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
 )
+FAX_LINE_PATTERN = re.compile(r"FAX|ＦＡＸ|Fax|fax", re.IGNORECASE)
 
 REGEX_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("電話番号",       PHONE_RE_STRICT),
@@ -374,7 +376,6 @@ REGEX_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("口座番号",       re.compile(r"(普通|当座)\s?\d{7,8}")),
 ]
 
-# 帳票ラベル → 検出カテゴリ のマッピング
 FORM_LABEL_RULES: dict[str, str] = {
     "担当者名": "Person",
     "氏名":     "Person",
@@ -385,16 +386,12 @@ FORM_LABEL_RULES: dict[str, str] = {
     "団体名":   "ORG",
 }
 
-# アンカー検出時に「値の終端」とみなす語
 ANCHOR_STOP_WORDS = [
     "FAX", "ＦＡＸ", "Fax",
     "役職名", "団体名", "出展名",
     "担当者名", "氏名", "電話番号", "メールアドレス",
     "住所", "所在地",
 ]
-
-# FAX行と判定するパターン
-FAX_LINE_PATTERN = re.compile(r"FAX|ＦＡＸ|Fax|fax", re.IGNORECASE)
 
 
 def detect_regex(text: str) -> list[tuple[str, str, int, int]]:
@@ -414,14 +411,8 @@ def detect_ner(nlp, text: str, labels: set[str]) -> list[tuple[str, str, int, in
 
 
 def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
-    """
-    帳票の項目名（担当者名・氏名・電話番号・メールアドレス等）の
-    直後の値を優先的に検出する。
-    """
     if not text.strip():
         return []
-
-    # スペース除去してマッチしやすくする
     txt = text.replace(" ", "").replace("\u3000", "")
     results: list[tuple[str, str, int, int]] = []
 
@@ -429,18 +420,13 @@ def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
         pos = txt.find(anchor)
         if pos == -1:
             continue
-
         value_start = pos + len(anchor)
         raw_tail = txt[value_start:]
-
-        # コロン・スペース・記号を読み飛ばす
         tail = re.sub(r"^[\s:：\-ー_.・]+", "", raw_tail)
         value_start += (len(raw_tail) - len(tail))
-
         if not tail:
             continue
 
-        # 電話番号ラベルの場合は PHONE_RE_STRICT で抽出
         if out_label == "電話番号":
             m = PHONE_RE_STRICT.search(tail)
             if m:
@@ -449,7 +435,6 @@ def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
                 results.append((m.group(), out_label, s, e))
             continue
 
-        # メールの場合は EMAIL_RE_STRICT で抽出
         if out_label == "メール":
             m = EMAIL_RE_STRICT.search(tail)
             if m:
@@ -458,7 +443,6 @@ def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
                 results.append((m.group(), out_label, s, e))
             continue
 
-        # 人名・住所・組織名は次のアンカー語の直前まで
         stop = len(tail)
         for sw in ANCHOR_STOP_WORDS:
             p = tail.find(sw)
@@ -466,12 +450,10 @@ def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
                 stop = min(stop, p)
 
         candidate = tail[:stop]
-        # 記号・不要文字を除去（日本語・英数・長音符を残す）
         candidate = re.sub(r"[^\u0020-\u007E\u3000-\u9FFFー]", "", candidate).strip()
         candidate = candidate.strip(":：- \t")
 
         if 2 <= len(candidate) <= 30:
-            # 元のテキスト（スペース除去前）での位置を探す
             s = txt.find(candidate, value_start)
             if s == -1:
                 s = value_start
@@ -484,7 +466,7 @@ def detect_form_anchors(text: str) -> list[tuple[str, str, int, int]]:
 
 
 # =====================================================================
-# 8. 重複リージョン除去（IoU ベース）
+# 8. 重複除去
 # =====================================================================
 
 def _iou(a: MaskRegion, b: MaskRegion) -> float:
@@ -499,9 +481,15 @@ def _iou(a: MaskRegion, b: MaskRegion) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def deduplicate_regions(regions: list[MaskRegion], iou_threshold: float = 0.5) -> list[MaskRegion]:
-    priority = {"anchor": 0, "ner": 1, "regex": 2}
-    sorted_regions = sorted(regions, key=lambda r: (priority.get(r.source, 9), r.top, r.left))
+def deduplicate_regions(
+    regions: list[MaskRegion],
+    iou_threshold: float = 0.5,
+) -> list[MaskRegion]:
+    priority = {"anchor": 0, "ner": 1, "regex": 2, "manual": 3}
+    sorted_regions = sorted(
+        regions,
+        key=lambda r: (priority.get(r.source, 9), r.top, r.left),
+    )
     kept: list[MaskRegion] = []
     suppressed = [False] * len(sorted_regions)
     for i, r in enumerate(sorted_regions):
@@ -550,7 +538,7 @@ def map_entity_to_boxes(
 
 
 # =====================================================================
-# 10. 匿名ラベル描画（PIL で日本語テキスト描画）
+# 10. 描画
 # =====================================================================
 
 def render_anon_labels(
@@ -636,15 +624,14 @@ def process_image(
     for line_text, line_boxes in lines:
         entities: list[tuple[str, str, int, int, str]] = []
 
-        # FAX行かどうかを判定（FAX行の電話番号はスキップ）
         is_fax_line = bool(FAX_LINE_PATTERN.search(line_text))
 
-        # 1) 定型帳票の項目名ベース検出（最優先）
+        # 1) 項目名ベース検出（最優先）
         if not is_fax_line:
             anchor_hits = detect_form_anchors(line_text)
             entities += [(t, l, s, e, "anchor") for t, l, s, e in anchor_hits]
 
-        # 2) NER（GiNZA が有効な場合のみ）
+        # 2) NER
         if use_ner and nlp is not None:
             ner_hits = detect_ner(nlp, line_text, target_labels)
             entities += [(t, l, s, e, "ner") for t, l, s, e in ner_hits]
@@ -652,7 +639,6 @@ def process_image(
         # 3) 正規表現
         if use_regex:
             regex_hits = detect_regex(line_text)
-            # FAX行の電話番号は除外
             if is_fax_line:
                 regex_hits = [x for x in regex_hits if x[1] != "電話番号"]
             entities += [(t, l, s, e, "regex") for t, l, s, e in regex_hits]
@@ -665,7 +651,6 @@ def process_image(
             if region:
                 all_regions.append(region)
 
-    # 重複排除
     all_regions = deduplicate_regions(all_regions)
 
     if font is None:
@@ -676,7 +661,7 @@ def process_image(
 
 
 # =====================================================================
-# 12. 画像前処理（解像度スケール）
+# 12. 画像前処理
 # =====================================================================
 
 def preprocess_image(image_bgr: np.ndarray, scale: float = 1.0) -> np.ndarray:
@@ -707,7 +692,71 @@ def scale_regions_back(regions: list[MaskRegion], scale: float) -> list[MaskRegi
 
 
 # =====================================================================
-# 13. Streamlit UI
+# 13. 手書き矩形 → MaskRegion 変換
+# =====================================================================
+
+MANUAL_LABEL_OPTIONS: dict[str, str] = {
+    "人名":     "Person",
+    "電話番号": "電話番号",
+    "メール":   "メール",
+    "住所":     "住所",
+    "組織名":   "ORG",
+    "その他":   "other",
+}
+
+
+def canvas_rects_to_regions(
+    canvas_data,
+    anon_mgr: AnonymizationManager,
+    entity_label: str,
+    display_w: int,
+    display_h: int,
+    orig_w: int,
+    orig_h: int,
+) -> list[MaskRegion]:
+    """
+    streamlit-drawable-canvas の描画データ（JSON）から
+    MaskRegion のリストを作る。
+    キャンバス表示サイズ → 元画像サイズ へ座標を変換する。
+    """
+    regions = []
+    if canvas_data is None or canvas_data.json_data is None:
+        return regions
+
+    objects = canvas_data.json_data.get("objects", [])
+    scale_x = orig_w / display_w
+    scale_y = orig_h / display_h
+
+    for i, obj in enumerate(objects):
+        if obj.get("type") != "rect":
+            continue
+        # fabric.js の座標系（left/top はスケール前）
+        left  = int(obj.get("left", 0) * scale_x)
+        top   = int(obj.get("top",  0) * scale_y)
+        w     = int(obj.get("width",  0) * obj.get("scaleX", 1) * scale_x)
+        h     = int(obj.get("height", 0) * obj.get("scaleY", 1) * scale_y)
+        right  = left + w
+        bottom = top  + h
+
+        if w < 5 or h < 5:
+            continue
+
+        label_key = f"manual_{i}"
+        anon = anon_mgr.get_anon_label(label_key, entity_label)
+
+        regions.append(MaskRegion(
+            original_text=label_key,
+            label=entity_label,
+            anon_text=anon,
+            left=left, top=top,
+            right=right, bottom=bottom,
+            source="manual",
+        ))
+    return regions
+
+
+# =====================================================================
+# 14. Streamlit UI
 # =====================================================================
 
 def hex_to_rgb(h: str) -> tuple[int, int, int]:
@@ -731,8 +780,8 @@ def main() -> None:
 
     st.title("🔒 画像プライバシー匿名化ツール")
     st.caption(
-        "画像内の人名・地名・電話番号等を検出し、一貫した匿名ラベルで置換します。\n"
-        "同一の名前は常に同じラベルに変換されます。外部 API 不使用・完全ローカル動作。"
+        "画像内の人名・地名・電話番号等を自動検出して匿名ラベルで置換します。\n"
+        "検出漏れは手書き矩形で追加できます。FAX行の電話番号は自動除外されます。"
     )
 
     # ---- サイドバー ----
@@ -740,20 +789,19 @@ def main() -> None:
         st.header("⚙️ 設定")
 
         st.subheader("検出方法")
-        use_ner = st.checkbox("NER（固有表現認識）", value=False, disabled=True)
+        use_ner   = st.checkbox("NER（固有表現認識）", value=False, disabled=True)
         use_regex = st.checkbox("正規表現ルール", value=True)
-
         if not use_ner and not use_regex:
             st.warning("少なくとも一方を有効にしてください。")
 
         st.subheader("NER ラベル選択")
-        st.caption("Cloud互換のため、現在はNERを一時停止しています。項目名ベース検出 + 正規表現で動作します。")
+        st.caption("Cloud互換のため、現在はNERを一時停止中。項目名ベース検出 + 正規表現で動作します。")
         selected = []
 
         st.subheader("OCR 設定")
         ocr_lang = st.text_input("Tesseract 言語コード", value="jpn+eng")
         conf_threshold = st.slider(
-            "OCR 信頼度の閾値（低いほど多くの文字を検出）",
+            "OCR 信頼度の閾値（低いほど多く検出）",
             min_value=0, max_value=90, value=30, step=5,
         )
         scale_factor = st.select_slider(
@@ -763,9 +811,9 @@ def main() -> None:
         )
 
         st.subheader("匿名ラベルの見た目")
-        bg_hex = st.color_picker("背景色", "#FFFFFF")
+        bg_hex  = st.color_picker("背景色", "#FFFFFF")
         txt_hex = st.color_picker("文字色", "#DC2828")
-        bg_color = hex_to_rgb(bg_hex)
+        bg_color   = hex_to_rgb(bg_hex)
         text_color = hex_to_rgb(txt_hex)
 
         st.divider()
@@ -779,8 +827,6 @@ def main() -> None:
             "| 電話番号 | 000-0000-0001 … |\n"
             "| 郵便番号 | 〒000-0001 … |\n"
             "| メール | anonymous001@… |\n"
-            "| 日付 | 0000年00月01日 … |\n"
-            "| マイナンバー | 0000-0000-0001 … |\n"
         )
 
         st.divider()
@@ -794,8 +840,8 @@ def main() -> None:
                 pytesseract.pytesseract.tesseract_cmd = tess_path
                 st.success("パスを適用しました。")
 
-    # ---- モデル・フォント読み込み ----
-    nlp = load_nlp()
+    # ---- フォント・モデル ----
+    nlp  = load_nlp()
     font = load_font(20)
 
     # ---- アップロード ----
@@ -810,19 +856,18 @@ def main() -> None:
         st.markdown(
             """
             **対応している個人情報の種類:**
-            - 👤 人名・氏名（帳票項目名ベース検出）
-            - 🏢 組織名・会社名（団体名ラベルベース）
-            - 📍 地名・住所
-            - 📞 電話番号（正規表現 ※FAX行は除外）
-            - 📮 郵便番号
+            - 👤 人名・氏名（帳票項目名ベース）
+            - 🏢 組織名・団体名
+            - 📍 住所・所在地
+            - 📞 電話番号（FAX行は自動除外）
             - 📧 メールアドレス
-            - 📅 生年月日・日付
-            - 🔢 マイナンバー・口座番号
+            - 📮 郵便番号
+            - 🖊️ 自動検出漏れ → 手書き矩形で追加可能
             """
         )
         st.stop()
 
-    # 全画像で共有する匿名化マネージャー
+    # 全画像共有の匿名化マネージャー
     anon_mgr = AnonymizationManager()
 
     results = []
@@ -831,7 +876,7 @@ def main() -> None:
     for idx, file in enumerate(uploaded):
         progress_bar.progress(
             idx / len(uploaded),
-            text=f"「{file.name}」を処理中… ({idx + 1}/{len(uploaded)})"
+            text=f"「{file.name}」を処理中… ({idx + 1}/{len(uploaded)})",
         )
 
         from PIL import Image as PILImage
@@ -840,7 +885,7 @@ def main() -> None:
 
         scaled_bgr = preprocess_image(image_bgr, scale_factor)
 
-        masked_scaled, regions_scaled, lines = process_image(
+        _, regions_scaled, lines = process_image(
             scaled_bgr, nlp, anon_mgr,
             use_ner=use_ner,
             use_regex=use_regex,
@@ -853,22 +898,28 @@ def main() -> None:
         )
 
         regions_orig = scale_regions_back(regions_scaled, scale_factor)
-        masked = render_anon_labels(image_bgr, regions_orig, font, bg_color, text_color)
-
-        results.append((file.name, pil_image, masked, regions_orig, lines))
+        results.append((file.name, pil_image, image_bgr, regions_orig, lines))
 
     progress_bar.progress(1.0, text="✅ 全ファイル処理完了")
 
-    # ---- 結果表示 ----
-    for fname, original, masked, regions, lines in results:
+    # ================================================================
+    # 結果表示 + 手書き追加UI
+    # ================================================================
+    for fname, original_pil, original_bgr, regions, lines in results:
         st.markdown(f"---\n### 📄 {fname}")
 
-        # 確認UI: チェックを外すと変換しない
-        if regions:
-            with st.expander(f"🔍 検出・置換結果（{len(regions)} 件）— チェックを外すと変換しません", expanded=True):
-                st.caption("FAX番号や誤検出はチェックを外してください。")
+        orig_h, orig_w = original_bgr.shape[:2]
 
-                selected_regions = []
+        # --------------------------------------------------
+        # ① 自動検出チェックUI
+        # --------------------------------------------------
+        if regions:
+            with st.expander(
+                f"🔍 自動検出結果（{len(regions)} 件）— チェックを外すと変換しません",
+                expanded=True,
+            ):
+                st.caption("FAX番号・誤検出はチェックを外してください。")
+                selected_regions: list[MaskRegion] = []
                 for i, r in enumerate(regions):
                     method_name = {
                         "anchor": "📌 項目名ベース",
@@ -885,40 +936,140 @@ def main() -> None:
                         selected_regions.append(r)
         else:
             selected_regions = []
-            st.warning("⚠️ 固有表現は検出されませんでした。OCR の信頼度閾値を下げてみてください。")
+            st.warning("⚠️ 自動検出ゼロ。手書きで範囲を追加してください。")
 
-        # チェック後のリージョンで再描画
-        original_bgr = cv2.cvtColor(np.array(original), cv2.COLOR_RGB2BGR)
-        masked_checked = render_anon_labels(
+        # --------------------------------------------------
+        # ② 手書き追加UI
+        # --------------------------------------------------
+        st.markdown("#### ✏️ 手書きで追加マスク（検出漏れ用）")
+        st.caption(
+            "下の画像上でマウスをドラッグして四角を描いてください。"
+            "複数描けます。描き終わったら「カテゴリ」を選んで「追加して再描画」ボタンを押してください。"
+        )
+
+        # キャンバス表示幅（画面幅に合わせて調整）
+        CANVAS_DISPLAY_W = 700
+        canvas_scale = CANVAS_DISPLAY_W / orig_w
+        CANVAS_DISPLAY_H = int(orig_h * canvas_scale)
+
+        # キャンバス背景用に自動検出済み画像を作成
+        auto_masked_bgr = render_anon_labels(
             original_bgr, selected_regions, font, bg_color, text_color
         )
-        masked_rgb = cv2.cvtColor(masked_checked, cv2.COLOR_BGR2RGB)
+        auto_masked_rgb = cv2.cvtColor(auto_masked_bgr, cv2.COLOR_BGR2RGB)
+
+        from PIL import Image as PILImage
+        canvas_bg_pil = PILImage.fromarray(auto_masked_rgb).resize(
+            (CANVAS_DISPLAY_W, CANVAS_DISPLAY_H)
+        )
+
+        # drawable-canvas
+        try:
+            from streamlit_drawable_canvas import st_canvas
+
+            col_canvas, col_ctrl = st.columns([3, 1])
+
+            with col_ctrl:
+                st.markdown("**追加するカテゴリ**")
+                manual_label_jp = st.selectbox(
+                    "カテゴリ選択",
+                    options=list(MANUAL_LABEL_OPTIONS.keys()),
+                    key=f"manual_label_{fname}",
+                    label_visibility="collapsed",
+                )
+                manual_label = MANUAL_LABEL_OPTIONS[manual_label_jp]
+
+                st.markdown("**描画色**")
+                draw_color = st.color_picker(
+                    "矩形の色",
+                    "#FF0000",
+                    key=f"draw_color_{fname}",
+                    label_visibility="collapsed",
+                )
+
+                st.markdown(" ")
+                add_button = st.button(
+                    "✅ 手書き領域を追加して\n再描画",
+                    key=f"add_manual_{fname}",
+                    use_container_width=True,
+                )
+                st.caption("※ボタンを押すまで追加されません")
+
+            with col_canvas:
+                canvas_result = st_canvas(
+                    fill_color="rgba(255, 0, 0, 0.15)",
+                    stroke_width=2,
+                    stroke_color=draw_color,
+                    background_image=canvas_bg_pil,
+                    update_streamlit=True,
+                    height=CANVAS_DISPLAY_H,
+                    width=CANVAS_DISPLAY_W,
+                    drawing_mode="rect",
+                    key=f"canvas_{fname}",
+                )
+
+            # ボタンが押されたら手書き領域を統合
+            if add_button:
+                manual_regions = canvas_rects_to_regions(
+                    canvas_result,
+                    anon_mgr,
+                    manual_label,
+                    display_w=CANVAS_DISPLAY_W,
+                    display_h=CANVAS_DISPLAY_H,
+                    orig_w=orig_w,
+                    orig_h=orig_h,
+                )
+                all_final_regions = deduplicate_regions(
+                    selected_regions + manual_regions
+                )
+                if manual_regions:
+                    st.success(f"✅ 手書き領域 {len(manual_regions)} 件を追加しました！")
+                else:
+                    st.info("手書き領域が検出されませんでした。四角を描いてから押してください。")
+            else:
+                all_final_regions = selected_regions
+
+        except ImportError:
+            # streamlit-drawable-canvas が入っていない場合のフォールバック
+            st.warning(
+                "⚠️ `streamlit-drawable-canvas` がインストールされていません。\n"
+                "`requirements.txt` に `streamlit-drawable-canvas==0.9.3` を追加して再デプロイしてください。"
+            )
+            all_final_regions = selected_regions
+
+        # --------------------------------------------------
+        # ③ 最終画像を描画して表示
+        # --------------------------------------------------
+        final_masked_bgr = render_anon_labels(
+            original_bgr, all_final_regions, font, bg_color, text_color
+        )
+        final_masked_rgb = cv2.cvtColor(final_masked_bgr, cv2.COLOR_BGR2RGB)
 
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("**元画像**")
-            st.image(original, use_container_width=True)
+            st.image(original_pil, use_container_width=True)
         with col2:
-            st.markdown("**匿名化後（確認反映済み）**")
-            st.image(masked_rgb, use_container_width=True)
+            st.markdown("**匿名化後（手書き追加込み）**")
+            st.image(final_masked_rgb, use_container_width=True)
 
         with st.expander("📝 OCR テキスト（デバッグ用）"):
             for line_text, _ in lines:
                 if line_text.strip():
                     st.text(line_text)
 
+        # ダウンロード
         buf = BytesIO()
-        from PIL import Image as PILImage
-        PILImage.fromarray(masked_rgb).save(buf, format="PNG")
-
+        PILImage.fromarray(final_masked_rgb).save(buf, format="PNG")
         st.download_button(
             label=f"⬇️ {fname} の匿名化画像をダウンロード",
             data=buf.getvalue(),
             file_name=f"anon_{fname.rsplit('.', 1)[0]}.png",
             mime="image/png",
+            key=f"dl_{fname}",
         )
 
-    # ---- 全体マッピングテーブル ----
+    # ---- マッピングテーブル ----
     st.markdown("---")
     st.subheader("📋 匿名化マッピング一覧（全画像共通）")
     st.caption("⚠️ この対応表は自分専用で保管し、第三者には絶対に共有しないでください。")
@@ -926,7 +1077,6 @@ def main() -> None:
     mapping = anon_mgr.get_mapping_table()
     if mapping:
         st.table(mapping)
-
         text_buf = io.StringIO()
         writer = csv.DictWriter(text_buf, fieldnames=["カテゴリ", "元テキスト", "匿名ラベル"])
         writer.writeheader()
