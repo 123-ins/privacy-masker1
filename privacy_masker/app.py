@@ -50,23 +50,6 @@ def _check_dependencies() -> list[str]:
             "- Windows: [GitHub releases](https://github.com/UB-Mannheim/tesseract/wiki) からインストール後、"
             "`pytesseract.pytesseract.tesseract_cmd` にパスを設定してください。"
         )
-
-    # spaCy + GiNZA
-    try:
-        import spacy
-        spacy.load("ja_ginza")
-    except OSError:
-        errors.append(
-            "❌ **GiNZA モデルが見つかりません。**\n"
-            "`pip install ja-ginza` を実行してください。\n"
-            "（重いモデルが必要な場合: `pip install ja-ginza-electra`）"
-        )
-    except ImportError:
-        errors.append(
-            "❌ **spaCy がインストールされていません。**\n"
-            "`pip install spacy ginza ja-ginza` を実行してください。"
-        )
-
     return errors
 
 
@@ -247,10 +230,10 @@ class AnonymizationManager:
 # 3. spaCy (GiNZA) キャッシュ読み込み
 # =====================================================================
 
-@st.cache_resource(show_spinner="spaCy (GiNZA) モデルを読み込み中…")
+@st.cache_resource
 def load_nlp():
-    import spacy
-    return spacy.load("ja_ginza")
+    return None
+
 
 
 # =====================================================================
@@ -758,21 +741,16 @@ def main() -> None:
         st.header("⚙️ 設定")
 
         st.subheader("検出方法")
-        use_ner = st.checkbox("NER（固有表現認識）", value=True)
+        use_ner = st.checkbox("NER（固有表現認識）", value=False, disabled=True)
+
         use_regex = st.checkbox("正規表現ルール", value=True)
 
         if not use_ner and not use_regex:
             st.warning("少なくとも一方を有効にしてください。")
 
         st.subheader("NER ラベル選択")
-        all_labels = [
-    "Person", "PERSON",
-    "ORG", "Organization",
-    "LOC", "Location", "GPE", "FAC", "Facility",
-]
-
-        ]
-        selected = st.multiselect("対象ラベル", all_labels, default=all_labels)
+        st.caption("Cloud互換のため、現在はNERを一時停止しています。項目名ベース検出 + 正規表現で動作します。")
+        selected = []
 
         st.subheader("OCR 設定")
         ocr_lang = st.text_input("Tesseract 言語コード", value="jpn+eng")
