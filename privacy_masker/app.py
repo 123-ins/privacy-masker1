@@ -955,7 +955,8 @@ def main() -> None:
         # use_column_width=True にして表示幅を DISPLAY_W に揃える
         try:
             from streamlit_image_coordinates import streamlit_image_coordinates
-            from PIL import Image as PILImage as PILImg
+            from PIL import Image as PILImage
+
 
             coords = streamlit_image_coordinates(
                 PILImg.fromarray(preview_img),
