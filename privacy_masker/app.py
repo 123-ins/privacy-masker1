@@ -640,9 +640,9 @@ def process_image(
     for line_text, line_boxes in lines:
                 entities: list[tuple[str, str, int, int, str]] = []
 
-        # 1) 定型帳票の項目名ベース検出（最優先）
-        anchor_hits = detect_form_anchors(line_text)
-            entities += [(t, l, s, e, "anchor") for t, l, s, e in anchor_hits]
+                # 1) 定型帳票の項目名ベース検出（最優先）
+                anchor_hits = detect_form_anchors(line_text)
+                entities += [(t, l, s, e, "anchor") for t, l, s, e in anchor_hits]
 
         # 2) NER
         if use_ner:
