@@ -1,10 +1,9 @@
 """
 app.py – 画像内の個人情報を匿名化ラベルで置換する Streamlit アプリ
 ====================================================================
-iPhone Safari 完全対応・タッチ2点指定モザイク版
-・PC    → ダブルクリックで1点目、ダブルクリックで2点目
-・iPhone → 長押しタップで1点目、長押しタップで2点目
+iPhone Safari 完全対応・消しゴム式モザイク版
 ・自動検出（帳票項目名ベース + 正規表現）
+・検出漏れは「画像をタップ/クリック1回」で中心にモザイク
 ・FAX行の電話番号は自動除外
 """
 
@@ -553,7 +552,7 @@ def render_anon_labels(
 
 
 # =====================================================================
-# 11. 描画：モザイク（手動領域のみ）
+# 11. 描画：モザイク（手動領域）
 # =====================================================================
 
 def apply_mosaic(
@@ -577,8 +576,8 @@ def apply_mosaic(
         else:
             roi = result[y1:y2, x1:x2]
             rh, rw = roi.shape[:2]
-            bw, bh = max(block_size, 1), max(block_size, 1)
-            small = cv2.resize(roi, (max(rw // bw, 1), max(rh // bh, 1)),
+            bw = max(block_size, 1)
+            small = cv2.resize(roi, (max(rw // bw, 1), max(rh // bw, 1)),
                                interpolation=cv2.INTER_LINEAR)
             result[y1:y2, x1:x2] = cv2.resize(
                 small, (rw, rh), interpolation=cv2.INTER_NEAREST
@@ -587,13 +586,38 @@ def apply_mosaic(
 
 
 # =====================================================================
-# 12. プレビュー画像生成（確定済み領域＋選択中マーカーを重ねる）
+# 12. タップ点→MaskRegion変換（消しゴム式）
 # =====================================================================
 
-def draw_selection_overlay(
+def point_to_region(
+    cx: int, cy: int,
+    brush_w: int, brush_h: int,
+    orig_w: int, orig_h: int,
+    index: int,
+) -> MaskRegion:
+    """
+    タップした中心座標(cx,cy)からブラシサイズの矩形を作る。
+    """
+    half_w = brush_w // 2
+    half_h = brush_h // 2
+    return MaskRegion(
+        original_text=f"manual_{index}",
+        label="手動",
+        anon_text="",
+        left=max(cx - half_w, 0),
+        top=max(cy - half_h, 0),
+        right=min(cx + half_w, orig_w),
+        bottom=min(cy + half_h, orig_h),
+        source="manual",
+    )
+
+
+# =====================================================================
+# 13. プレビュー画像生成（確定済み領域を赤枠で表示）
+# =====================================================================
+
+def draw_confirmed_overlay(
     image_rgb: np.ndarray,
-    point1: Optional[tuple[int, int]],
-    point2: Optional[tuple[int, int]],
     confirmed_regions: list[MaskRegion],
     display_w: int,
     orig_w: int,
@@ -602,42 +626,25 @@ def draw_selection_overlay(
     from PIL import Image as PILImage, ImageDraw
 
     scale  = display_w / orig_w
-    disp_h = int(image_rgb.shape[0] * scale)
+    disp_h = int(orig_h * scale)
 
-    # numpy でリサイズ（真っ黒防止）
     resized  = cv2.resize(image_rgb, (display_w, disp_h),
                           interpolation=cv2.INTER_LINEAR)
     pil_base = PILImage.fromarray(resized)
     overlay  = PILImage.new("RGBA", (display_w, disp_h), (0, 0, 0, 0))
     draw     = ImageDraw.Draw(overlay)
 
-    # 確定済み領域（赤い半透明）
     for r in confirmed_regions:
         rx1 = int(r.left   * scale)
         ry1 = int(r.top    * scale)
         rx2 = int(r.right  * scale)
         ry2 = int(r.bottom * scale)
-        draw.rectangle([rx1, ry1, rx2, ry2],
-                       fill=(255, 0, 0, 90), outline=(255, 0, 0, 220), width=2)
-
-    # 1点目（緑の十字）
-    if point1 is not None:
-        px  = int(point1[0] * scale)
-        py  = int(point1[1] * scale)
-        arm = 12
-        draw.line([(px - arm, py), (px + arm, py)], fill=(0, 220, 0, 255), width=3)
-        draw.line([(px, py - arm), (px, py + arm)], fill=(0, 220, 0, 255), width=3)
-        draw.ellipse([(px - 6, py - 6), (px + 6, py + 6)],
-                     outline=(0, 220, 0, 255), width=2)
-
-    # 2点プレビュー矩形（青）
-    if point1 is not None and point2 is not None:
-        bx1 = int(min(point1[0], point2[0]) * scale)
-        by1 = int(min(point1[1], point2[1]) * scale)
-        bx2 = int(max(point1[0], point2[0]) * scale)
-        by2 = int(max(point1[1], point2[1]) * scale)
-        draw.rectangle([bx1, by1, bx2, by2],
-                       fill=(0, 100, 255, 60), outline=(0, 100, 255, 220), width=2)
+        draw.rectangle(
+            [rx1, ry1, rx2, ry2],
+            fill=(255, 0, 0, 80),
+            outline=(255, 0, 0, 220),
+            width=2,
+        )
 
     composite = PILImage.alpha_composite(
         pil_base.convert("RGBA"), overlay
@@ -646,7 +653,7 @@ def draw_selection_overlay(
 
 
 # =====================================================================
-# 13. メインパイプライン
+# 14. メインパイプライン
 # =====================================================================
 
 def process_image(
@@ -700,6 +707,7 @@ def process_image(
                 all_regions.append(region)
 
     all_regions = deduplicate_regions(all_regions)
+
     if font is None:
         font = load_font(20)
     result = render_anon_labels(image, all_regions, font, bg_color, text_color)
@@ -707,7 +715,7 @@ def process_image(
 
 
 # =====================================================================
-# 14. 前処理・スケール戻し
+# 15. 前処理・スケール戻し
 # =====================================================================
 
 def preprocess_image(image_bgr: np.ndarray, scale: float = 1.0) -> np.ndarray:
@@ -735,7 +743,7 @@ def hex_to_rgb(h: str) -> tuple[int, int, int]:
 
 
 # =====================================================================
-# 15. Streamlit メイン
+# 16. Streamlit メイン
 # =====================================================================
 
 def main() -> None:
@@ -753,7 +761,7 @@ def main() -> None:
         st.stop()
 
     st.title("🔒 画像プライバシー匿名化ツール")
-    st.caption("自動検出 ＋ 2点指定モザイク追加。PC はダブルクリック、iPhone は長押しで指定。")
+    st.caption("自動検出 ＋ タップ1回で消しゴム式モザイク追加。iPhone Safari 対応。")
 
     # ----------------------------------------------------------------
     # サイドバー
@@ -785,7 +793,13 @@ def main() -> None:
         bg_color   = hex_to_rgb(bg_hex)
         text_color = hex_to_rgb(txt_hex)
 
-        st.subheader("手動モザイク設定")
+        st.subheader("🖊️ 消しゴムモザイク設定")
+        brush_w = st.slider(
+            "横幅（px）", min_value=20, max_value=400, value=120, step=10
+        )
+        brush_h = st.slider(
+            "縦幅（px）", min_value=10, max_value=200, value=40, step=5
+        )
         mosaic_type = st.radio(
             "モザイクの種類",
             options=["mosaic", "black"],
@@ -823,10 +837,11 @@ def main() -> None:
 **使い方:**
 1. 画像をアップロード
 2. 自動検出結果を確認・チェック調整
-3. 検出漏れは画像を **2回操作** してモザイク範囲を指定
-   - 💻 PC：**ダブルクリック**で1点目 → **ダブルクリック**で2点目
-   - 📱 iPhone：**長押し**で1点目 → **長押し**で2点目
-4. ダウンロード
+3. 検出漏れは画像を **タップ/クリック1回** → その場所にモザイク
+4. 何度でもタップできます・やり直しもできます
+5. ダウンロード
+
+📱 **iPhone Safari でもそのまま使えます**
 """)
         st.stop()
 
@@ -862,20 +877,10 @@ def main() -> None:
         st.markdown(f"---\n### 📄 {fname}")
 
         orig_h, orig_w = original_bgr.shape[:2]
+        key_manual = f"manual_{fname}"
 
-        key_manual   = f"manual_{fname}"
-        key_pt1      = f"pt1_{fname}"
-        key_pt2      = f"pt2_{fname}"
-        key_click_ct = f"click_ct_{fname}"   # クリック回数カウンタ
-
-        for k, v in [
-            (key_manual,   []),
-            (key_pt1,      None),
-            (key_pt2,      None),
-            (key_click_ct, 0),
-        ]:
-            if k not in st.session_state:
-                st.session_state[k] = v
+        if key_manual not in st.session_state:
+            st.session_state[key_manual] = []
 
         # ============================================================
         # STEP 1: 自動検出チェック
@@ -906,88 +911,57 @@ def main() -> None:
             st.warning("⚠️ 自動検出ゼロ。STEP 2 で手動追加してください。")
 
         # ============================================================
-        # STEP 2: 2点指定でモザイク追加
+        # STEP 2: 消しゴム式タップでモザイク追加
         # ============================================================
-        st.markdown("#### 🖊️ STEP 2：検出漏れをモザイク追加")
+        st.markdown("#### 🖊️ STEP 2：タップ/クリックで消しゴム式モザイク追加")
 
-        # 操作ガイド（状態に応じて変化）
-        pt1 = st.session_state[key_pt1]
-        pt2 = st.session_state[key_pt2]
+        manual_regions: list[MaskRegion] = st.session_state[key_manual]
 
-        if pt1 is None:
-            st.info(
-                "💻 PC：隠したい範囲の **左上をダブルクリック**\n\n"
-                "📱 iPhone：隠したい範囲の **左上を長押し**"
-            )
-        elif pt2 is None:
-            st.info(
-                f"✅ 1点目 ({pt1[0]}, {pt1[1]}) を記録しました\n\n"
-                "💻 PC：範囲の **右下をダブルクリック**\n\n"
-                "📱 iPhone：範囲の **右下を長押し**"
-            )
-        else:
-            st.success(
-                f"✅ 範囲プレビュー: "
-                f"({min(pt1[0],pt2[0])}, {min(pt1[1],pt2[1])}) 〜 "
-                f"({max(pt1[0],pt2[0])}, {max(pt1[1],pt2[1])})\n\n"
-                "↓「この範囲をモザイクに追加」ボタンを押してください"
-            )
-
-        # プレビュー画像生成
-        auto_masked_bgr = render_anon_labels(
+        # 現在のモザイク適用済み画像をプレビュー用に生成
+        work_bgr = render_anon_labels(
             original_bgr, selected_regions, font, bg_color, text_color
         )
-        auto_masked_rgb = cv2.cvtColor(auto_masked_bgr, cv2.COLOR_BGR2RGB)
+        work_bgr = apply_mosaic(
+            work_bgr, manual_regions,
+            mosaic_type=mosaic_type, block_size=mosaic_block,
+        )
+        work_rgb = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2RGB)
 
-        DISPLAY_W = 680
-
-        preview_img = draw_selection_overlay(
-            auto_masked_rgb,
-            st.session_state[key_pt1],
-            st.session_state[key_pt2],
-            st.session_state[key_manual],
+        DISPLAY_W = 700
+        preview_img = draw_confirmed_overlay(
+            work_rgb, manual_regions,
             display_w=DISPLAY_W,
             orig_w=orig_w,
             orig_h=orig_h,
         )
 
-        # ---- streamlit-image-coordinates で座標取得 ----
-        # use_column_width=True にして表示幅を DISPLAY_W に揃える
+        st.info(
+            "👆 **隠したい場所を1回タップ/クリック** するだけでモザイクがかかります。\n"
+            "サイズは左サイドバーの「横幅・縦幅」で調整できます。"
+        )
+
+        # streamlit-image-coordinates でタップ座標を取得
         try:
             from streamlit_image_coordinates import streamlit_image_coordinates
             from PIL import Image as PILImage
-
 
             coords = streamlit_image_coordinates(
                 PILImage.fromarray(preview_img),
                 key=f"coords_{fname}",
             )
 
-
             if coords is not None:
-                # 表示座標 → 元画像座標へ変換
+                # 表示スケール → 元画像スケールに変換
                 scale_back = orig_w / DISPLAY_W
-                real_x = int(coords["x"] * scale_back)
-                real_y = int(coords["y"] * scale_back)
+                cx = int(coords["x"] * scale_back)
+                cy = int(coords["y"] * scale_back)
 
-                # クリック回数で1点目・2点目を切り替え
-                ct = st.session_state[key_click_ct]
-
-                # 同じ座標の連続反応を無視（誤検知防止）
-                prev_pt = st.session_state[key_pt1] if ct % 2 == 1 else None
-                is_same = (prev_pt is not None and
-                           abs(prev_pt[0] - real_x) < 5 and
-                           abs(prev_pt[1] - real_y) < 5)
-
-                if not is_same:
-                    if st.session_state[key_pt1] is None:
-                        st.session_state[key_pt1] = (real_x, real_y)
-                        st.session_state[key_click_ct] = ct + 1
-                        st.rerun()
-                    elif st.session_state[key_pt2] is None:
-                        st.session_state[key_pt2] = (real_x, real_y)
-                        st.session_state[key_click_ct] = ct + 1
-                        st.rerun()
+                new_r = point_to_region(
+                    cx, cy, brush_w, brush_h, orig_w, orig_h,
+                    index=len(st.session_state[key_manual]),
+                )
+                st.session_state[key_manual].append(new_r)
+                st.rerun()
 
         except ImportError:
             st.warning(
@@ -996,76 +970,33 @@ def main() -> None:
                 "再デプロイしてください。"
             )
 
-        # ---- ボタン3つ ----
-        col_add, col_reset1, col_reset_all = st.columns(3)
-
-        with col_add:
-            if pt1 is not None and pt2 is not None:
-                if st.button(
-                    "✅ この範囲をモザイクに追加",
-                    key=f"confirm_{fname}",
-                    use_container_width=True,
-                ):
-                    new_r = MaskRegion(
-                        original_text=f"manual_{len(st.session_state[key_manual])}",
-                        label="手動",
-                        anon_text="",
-                        left=min(pt1[0], pt2[0]),
-                        top=min(pt1[1], pt2[1]),
-                        right=max(pt1[0], pt2[0]),
-                        bottom=max(pt1[1], pt2[1]),
-                        source="manual",
-                    )
-                    st.session_state[key_manual].append(new_r)
-                    st.session_state[key_pt1]      = None
-                    st.session_state[key_pt2]      = None
-                    st.session_state[key_click_ct] = 0
-                    st.rerun()
-
-        with col_reset1:
+        # ---- 操作ボタン ----
+        col_undo, col_reset = st.columns(2)
+        with col_undo:
             if st.button(
-                "↩️ 選択をやり直す",
-                key=f"reset1_{fname}",
+                "↩️ 1つ戻す",
+                key=f"undo_{fname}",
                 use_container_width=True,
+                disabled=len(manual_regions) == 0,
             ):
-                st.session_state[key_pt1]      = None
-                st.session_state[key_pt2]      = None
-                st.session_state[key_click_ct] = 0
+                st.session_state[key_manual].pop()
                 st.rerun()
 
-        with col_reset_all:
+        with col_reset:
             if st.button(
-                "🗑️ 手動追加を全削除",
-                key=f"reset_all_{fname}",
+                "🗑️ 手動モザイクを全削除",
+                key=f"reset_{fname}",
                 use_container_width=True,
+                disabled=len(manual_regions) == 0,
             ):
-                st.session_state[key_manual]   = []
-                st.session_state[key_pt1]      = None
-                st.session_state[key_pt2]      = None
-                st.session_state[key_click_ct] = 0
+                st.session_state[key_manual] = []
                 st.rerun()
 
-        # ---- 追加済みリスト ----
-        manual_regions: list[MaskRegion] = st.session_state[key_manual]
         if manual_regions:
-            with st.expander(
-                f"📋 追加済み手動モザイク（{len(manual_regions)} 件）",
-                expanded=False,
-            ):
-                for mi, mr in enumerate(manual_regions):
-                    col_i, col_d = st.columns([5, 1])
-                    with col_i:
-                        st.caption(
-                            f"#{mi + 1}　"
-                            f"左:{mr.left} 上:{mr.top} 右:{mr.right} 下:{mr.bottom}"
-                        )
-                    with col_d:
-                        if st.button("🗑️", key=f"del_{fname}_{mi}"):
-                            st.session_state[key_manual].pop(mi)
-                            st.rerun()
+            st.caption(f"手動モザイク追加済み：{len(manual_regions)} 箇所")
 
         # ============================================================
-        # STEP 3: 最終画像生成・表示・ダウンロード
+        # STEP 3: 最終画像・ダウンロード
         # ============================================================
         st.markdown("#### 🖼️ STEP 3：最終プレビュー＆ダウンロード")
 
